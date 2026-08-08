@@ -1,0 +1,35 @@
+{
+  "name": "swarmlord",
+  "version": "0.1.0",
+  "description": "Agent swarm composer — an append-only event-log substrate with blackboard coordination, emergent spawning, and provider-agnostic agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "demo": "tsx examples/research-swarm.ts"
+  },
+  "keywords": [
+    "agents",
+    "swarm",
+    "multi-agent",
+    "blackboard",
+    "event-sourcing",
+    "llm"
+  ],
+  "author": "cdrn",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.116.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.11",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
