@@ -44,9 +44,13 @@ async function main(): Promise<void> {
   const adapters: ModelAdapter[] = []
 
   if (process.env.OPENAI_API_KEY) {
+    // Model is configurable — a given key/project may not have access to every
+    // model (spawning onto one it can't reach 403s and auto-retires it). Set
+    // OPENAI_MODEL to match your project; gpt-4o is broadly available.
+    const openaiModel = process.env.OPENAI_MODEL ?? 'gpt-4o'
     adapters.push(
       new OpenAIAdapter({
-        model: 'gpt-5',
+        model: openaiModel,
         manifest: {
           provider: 'openai',
           strengths: [
@@ -62,7 +66,7 @@ async function main(): Promise<void> {
         },
       }),
     )
-    detected.push('openai')
+    detected.push(`openai (${openaiModel})`)
   }
 
   if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {

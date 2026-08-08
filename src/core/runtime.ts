@@ -463,6 +463,18 @@ export class Swarm {
     state.lastActivityAt = Date.now()
   }
 
+  /** Wake an agent's still-active parent with a supervision notice. */
+  private notifyParent(child: AgentState, text: string): void {
+    if (child.parent === null) return
+    const parent = this.agents.get(child.parent)
+    if (parent === undefined || parent.status === 'done') return
+    parent.messages.push({
+      role: 'user',
+      content: `(Supervision notice about a worker you spawned.)\n${text}`,
+    })
+    if (parent.status === 'idle') parent.status = 'ready'
+  }
+
   private protocol(): string {
     return this.protocolBase + (this.protocolAppendix ? `\n\n${this.protocolAppendix}` : '')
   }
@@ -798,18 +810,36 @@ export class Swarm {
       // One agent's API failure must not kill the swarm: record it, retire
       // the agent, and let the run continue.
       const message = e instanceof Error ? e.message : String(e)
+      const model = state.adapter.name
       state.status = 'done'
       state.summary = `adapter error: ${message}`
       this.setActivity(state, `adapter error: ${message}`)
+
+      // A provisioning-class failure (bad key, no access to the model, model
+      // not found) will hit EVERY agent routed to this model the same way —
+      // so auto-retire it, loudly, and tell the overseer to reroute rather
+      // than let the whole swarm bleed out one agent at a time.
+      const provisioning = isProvisioningError(e)
+      if (provisioning && !this.retired.has(model) && this.adapterPool.has(model)) {
+        this.retired.add(model)
+      }
       this.log.append({
         type: 'system',
         agent: name,
         channel: null,
-        body: `adapter error: ${message}`,
-        tags: [],
+        body: provisioning
+          ? `model "${model}" failed for ${name} and was auto-retired (${message}). Its task is unfinished — respawn it on a working model.`
+          : `adapter error on ${name} (${model}): ${message}`,
+        tags: provisioning ? ['adapter-error', 'model', 'retire', 'reroute'] : ['adapter-error'],
         refs: [],
-        meta: { error: message },
+        meta: { error: message, model, provisioning, autoRetired: provisioning },
       })
+      // Supervision signal: tell the parent its child died so it can reroute,
+      // even if the parent didn't subscribe to the failure. Lineage we already
+      // track becomes a notification tree.
+      this.notifyParent(state, provisioning
+        ? `Your worker "${name}" (on model "${model}") died: ${message}. That model has been auto-retired, so its task is unfinished — respawn the work on a working model (check list_models).`
+        : `Your worker "${name}" hit an adapter error: ${message}. Its task may be unfinished — consider respawning it.`)
       this.deliverNewEvents(name)
       return `adapter error: ${message}`
     }
@@ -1046,6 +1076,29 @@ function sleep(ms: number): Promise<void> {
 function providerFromName(name: string): string {
   const colon = name.indexOf(':')
   return colon > 0 ? name.slice(0, colon) : name
+}
+
+/**
+ * Whether an adapter error is a model-level provisioning failure (bad/missing
+ * key, no access to the model, unknown model) rather than a transient blip —
+ * i.e. one that would recur for every agent routed to the same model. Checks
+ * an SDK-style numeric `status` when present, else sniffs the message.
+ */
+function isProvisioningError(e: unknown): boolean {
+  const status = (e as { status?: unknown } | null)?.status
+  if (typeof status === 'number' && (status === 401 || status === 403 || status === 404)) {
+    return true
+  }
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase()
+  return (
+    /\b(401|403|404)\b/.test(msg) ||
+    msg.includes('does not have access') ||
+    msg.includes('invalid api key') ||
+    msg.includes('incorrect api key') ||
+    msg.includes('authentication') ||
+    msg.includes('permission') ||
+    (msg.includes('model') && (msg.includes('not found') || msg.includes('does not exist')))
+  )
 }
 
 function describeToolCalls(calls: ToolCall[]): string {

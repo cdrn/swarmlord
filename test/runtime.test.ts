@@ -535,6 +535,48 @@ describe('Swarm runtime', () => {
     expect(opEvents.some(e => e.body.includes('operator → overseer'))).toBe(true)
   })
 
+  it('auto-retires a model on a provisioning error and notifies the parent to reroute', async () => {
+    // A "broken" model that always 403s, plus a working default.
+    const broken = namedMock('openai:gpt-x', () => {
+      const err = Object.assign(new Error('403 Project does not have access to model gpt-x'), {
+        status: 403,
+      })
+      throw err
+    })
+    let rerouteSeen = false
+    let overseerTurns = 0
+    const working = new MockAdapter(req => {
+      const who = /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+      if (who === 'overseer') {
+        overseerTurns++
+        if (overseerTurns === 1) {
+          // Spawn a worker onto the broken model, then park waiting for it.
+          return turnOf([
+            { name: 'spawn', input: { name: 'w', model: 'openai:gpt-x', role: 'r', prompt: 'do it' } },
+            { name: 'subscribe', input: { types: ['agent_done'] } },
+            { name: 'idle', input: { reason: 'waiting on w' } },
+          ])
+        }
+        // Woken by the supervision notice — confirm we heard about the failure.
+        rerouteSeen = req.messages.some(
+          m => m.role === 'user' && m.content.includes('Supervision notice') && m.content.includes('gpt-x'),
+        )
+        return turnOf([{ name: 'complete', input: { summary: 'rerouted' } }])
+      }
+      return turnOf([{ name: 'complete', input: { summary: 'worker' } }])
+    })
+
+    const swarm = new Swarm({ adapter: working, adapters: [broken], maxTotalTurns: 12 })
+    const result = await swarm.run('route around a broken model')
+
+    // The broken model auto-retired, the parent was woken and rerouted.
+    expect(rerouteSeen).toBe(true)
+    expect(result.finalSummaries.overseer).toBe('rerouted')
+    expect(swarm.catalog().find(m => m.name === 'openai:gpt-x')?.retired).toBe(true)
+    const retireEvents = swarm.log.query({ types: ['system'], tagsAny: ['reroute'] })
+    expect(retireEvents.some(e => e.body.includes('auto-retired'))).toBe(true)
+  })
+
   it('holds at the turn cap and resumes when the cap is raised (holdAtCap)', async () => {
     let swarm: Swarm
     let turns = 0
