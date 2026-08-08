@@ -102,6 +102,37 @@ Try it on the demo:
 ANTHROPIC_API_KEY=... npx tsx examples/research-swarm.ts --view
 ```
 
+## Managing swarms
+
+One process, many swarms: the `Hive` keeps each swarm as a sqlite event log on
+disk plus a metadata record. Create runs a new swarm, stop winds one down,
+archive retires it, delete removes it — and archived or finished swarms stay
+fully inspectable, because the log is the artifact.
+
+```ts
+import { Hive, startHive } from 'swarmlord'
+
+const hive = new Hive({
+  dir: 'swarms',              // one .db per swarm, plus a hive.json index
+  createSwarm: dbPath => {
+    const swarm = new Swarm({ adapter: new AnthropicAdapter(), dbPath /* , ... */ })
+    swarm.spawn(null, librarianSpec())
+    return swarm
+  },
+})
+
+const handle = await startHive(hive)
+console.log(handle.url)       // home screen: create, watch, stop, archive
+```
+
+`startHive` serves the same dashboard as `startViewer`, fronted by a home
+screen listing every swarm; each entry opens the full live view — or the
+post-mortem view of a finished run. Try it:
+
+```
+ANTHROPIC_API_KEY=... npx tsx examples/hive.ts
+```
+
 ## Configuration
 
 Everything tunable lives on `SwarmOptions`:
@@ -131,15 +162,48 @@ const swarm = new Swarm({
 
   pinSlots: 3,                          // pin scarcity per agent
   claimTtlMs: 300_000,                  // claim lease duration
+  turnDelayMs: 0,                       // pause before each turn — slow a swarm down to watch it
+  hiveNames: true,                      // agent-initiated spawns always get generated hive names
   onEvent: evt => { /* every appended event */ },
   onTurn: info => { /* every adapter turn */ },
 })
 ```
 
-Per-agent model mixing: any spec passed from code can carry its own adapter —
-`swarm.spawn(null, { name: 'scout', role: 'scout', prompt: '...', adapter: cheapAdapter })`
-— while the swarm default covers everyone else. Snapshots report which adapter
-each agent runs on.
+Most of this is live: `swarm.configure({...})` adjusts `maxAgents`,
+`maxTotalTurns`, `pinSlots`, `claimTtlMs`, `tierWeights`, `protocolAppendix`,
+`turnDelayMs`, `hiveNames`, tier assignments, and `paused` (freeze/resume
+turn-taking) on a running swarm — the viewer's settings drawer is a front-end
+for it. There is also an operator direct line: `swarm.message(agent, text)`
+injects a message straight into an agent's context, delivered before its next
+turn; the viewer's console does the same.
+
+### Tiers
+
+Swarms mix model classes through three named tiers — castes by expense and
+proficiency:
+
+```ts
+const swarm = new Swarm({
+  adapter: new AnthropicAdapter(),   // default when no tier applies
+  tiers: {
+    heavy:    new AnthropicAdapter(),                                // deep synthesis, judgment
+    standard: new AnthropicAdapter({ model: 'claude-sonnet-4-6' }),  // everyday work
+    light:    new AnthropicAdapter({ model: 'claude-haiku-4-5' }),   // scanning, mechanical tasks
+  },
+  tierWeights: { standard: 3, light: 1 },
+})
+```
+
+The *spawning agent* chooses: the `spawn` verb takes `tier`, and its
+description teaches the trade-off (don't burn heavy on a listing job, don't
+send light to synthesize). When a spawn names no tier, `tierWeights` decides
+by weighted sample — but only for agent-initiated spawns. Code-level spawns
+(`run()`, `swarm.spawn(...)`) use the swarm default unless you say otherwise:
+the weights model an agent declining to choose, not your own calls.
+
+Any spec passed from code can also carry its own adapter directly —
+`swarm.spawn(null, { ..., adapter: someAdapter })` — which wins over tiers.
+Snapshots report each agent's tier and adapter, and the viewer badges them.
 
 Subscriptions are how agents wake: an idle agent resumes only when an event
 matching one of its standing queries arrives (or when anything is pinned —

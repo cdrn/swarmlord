@@ -110,6 +110,45 @@ describe('viewer server', () => {
     }
   })
 
+  it('serves and updates config at /api/config', async () => {
+    const swarm = await fixtureSwarm()
+    const handle = await startViewer(swarm, { port: 0 })
+    try {
+      const before = (await (await fetch(`${handle.url}/api/config`)).json()) as {
+        adapter: string
+        maxTotalTurns: number
+        maxAgents: number
+        rootPrompt: string
+        protocol: string
+      }
+      expect(before.adapter).toBe('mock')
+      expect(before.maxTotalTurns).toBe(20)
+      expect(before.rootPrompt.length).toBeGreaterThan(0)
+      expect(before.protocol.length).toBeGreaterThan(0)
+
+      const updated = (await (
+        await fetch(`${handle.url}/api/config`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ maxTotalTurns: 55, maxAgents: 5 }),
+        })
+      ).json()) as { maxTotalTurns: number; maxAgents: number }
+      expect(updated.maxTotalTurns).toBe(55)
+      expect(updated.maxAgents).toBe(5)
+      expect(swarm.config().maxTotalTurns).toBe(55)
+
+      const bad = await fetch(`${handle.url}/api/config`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ maxAgents: -3 }),
+      })
+      expect(bad.status).toBe(400)
+      expect(swarm.config().maxAgents).toBe(5)
+    } finally {
+      await handle.close()
+    }
+  })
+
   it('404s on unknown paths', async () => {
     const swarm = await fixtureSwarm()
     const handle = await startViewer(swarm, { port: 0 })

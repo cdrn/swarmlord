@@ -7,10 +7,20 @@
 
 import { EventLog } from './log.js'
 import { Blackboard } from './board.js'
+import { generateAgentName } from './names.js'
 import { matchesFilter, type SubscriptionFilter } from './subscriptions.js'
 import type { EventType, SwarmEvent } from './events.js'
 import type { ModelAdapter, NeutralMessage, ToolCall, TurnResult } from '../adapters/types.js'
 import { executeVerb, toolDefs, type VerbContext } from './verbs.js'
+
+/**
+ * Agent castes by model expense/proficiency. Map them to adapters via
+ * SwarmOptions.tiers; spawning agents pick a tier per spawn (the verb teaches
+ * when), or omit it and let SwarmOptions.tierWeights decide.
+ */
+export type TierName = 'heavy' | 'standard' | 'light'
+
+export const TIER_NAMES: readonly TierName[] = ['heavy', 'standard', 'light']
 
 export interface AgentSpec {
   name: string
@@ -20,9 +30,11 @@ export interface AgentSpec {
   /**
    * Per-agent adapter override — e.g. a cheaper model for scouts while the
    * overseer runs the big one. Only settable from code (specs passed to
-   * spawn()/run()); the spawn verb can't reach it.
+   * spawn()/run()); the spawn verb can't reach it. Wins over `tier`.
    */
   adapter?: ModelAdapter
+  /** Named tier from SwarmOptions.tiers. The spawn verb can set this. */
+  tier?: TierName
 }
 
 export interface SwarmOptions {
@@ -38,6 +50,30 @@ export interface SwarmOptions {
    * overrides these field by field.
    */
   root?: Partial<AgentSpec>
+  /**
+   * Named model tiers. Spawns that name a tier get its adapter; spawns that
+   * don't are sampled from tierWeights (falling back to the swarm default
+   * adapter when no weights are set).
+   */
+  tiers?: Partial<Record<TierName, ModelAdapter>>
+  /**
+   * Relative weights for sampling a tier when a spawn names none, e.g.
+   * { heavy: 1, standard: 3, light: 6 }. Only configured tiers count.
+   */
+  tierWeights?: Partial<Record<TierName, number>>
+  /**
+   * Extra adapters beyond the default and tier ones, made assignable to
+   * tiers at runtime via configure() / the viewer's settings drawer.
+   */
+  adapters?: ModelAdapter[]
+  /** Milliseconds to wait before each turn — throttle a swarm to watch it. */
+  turnDelayMs?: number
+  /**
+   * When true, agent-initiated spawns always get generated hive names
+   * (vexeth, skarnix, ...) regardless of the name the spawner asked for.
+   * Roles still describe what an agent does; names are just identity.
+   */
+  hiveNames?: boolean
   /**
    * Replace the built-in protocol preamble (the shared system-prompt rules
    * every agent gets). Start from the exported PROTOCOL_PREAMBLE to tweak
@@ -72,13 +108,57 @@ export interface AgentSnapshot {
   summary: string | null
   /** Name of the adapter this agent runs on (per-agent override or swarm default). */
   adapter: string
+  /** The tier this agent was spawned into, if tiers are configured. */
+  tier: TierName | null
+}
+
+export interface SwarmConfigView {
+  adapter: string
+  /** null = unlimited (JSON can't carry Infinity). */
+  maxAgents: number | null
+  maxTotalTurns: number | null
+  turnsTaken: number
+  pinSlots: number
+  claimTtlMs: number
+  rootName: string
+  rootPrompt: string
+  protocol: string
+  protocolAppendix: string
+  paused: boolean
+  turnDelayMs: number
+  hiveNames: boolean
+  /** Configured tier name → adapter name. */
+  tiers: Partial<Record<TierName, string>>
+  tierWeights: Partial<Record<TierName, number>>
+  /** Names of every adapter in the pool — assignable to tiers via configure(). */
+  availableAdapters: string[]
+}
+
+export interface SwarmConfigUpdate {
+  /** null lifts the cap entirely. */
+  maxAgents?: number | null
+  maxTotalTurns?: number | null
+  /** Reassign tiers to pooled adapters by name; null clears a tier. */
+  tiers?: Partial<Record<TierName, string | null>>
+  /** Replaces the whole weight set. */
+  tierWeights?: Partial<Record<TierName, number>>
+  pinSlots?: number
+  claimTtlMs?: number
+  /** Freeze/resume turn-taking. A paused swarm never terminates. */
+  paused?: boolean
+  turnDelayMs?: number
+  /** Replaces the appendix; applies to every subsequent turn's system prompt. */
+  protocolAppendix?: string
+  /** Toggle forced hive names for agent-initiated spawns. */
+  hiveNames?: boolean
 }
 
 export interface SwarmSnapshot {
   agents: AgentSnapshot[]
   turnsTaken: number
-  maxTotalTurns: number
-  maxAgents: number
+  /** null = unlimited. */
+  maxTotalTurns: number | null
+  maxAgents: number | null
   lastEventId: number
 }
 
@@ -86,6 +166,9 @@ interface AgentState {
   spec: AgentSpec
   status: AgentStatus
   parent: string | null
+  /** Resolved at spawn: spec.adapter > tiers[spec.tier] > sampled/default. */
+  adapter: ModelAdapter
+  tier: TierName | null
   turns: number
   lastActivity: string
   lastActivityAt: number
@@ -133,10 +216,19 @@ export class Swarm {
   readonly board: Blackboard
 
   private readonly adapter: ModelAdapter
-  private readonly maxAgents: number
-  private readonly maxTotalTurns: number
-  private readonly protocol: string
+  private maxAgents: number
+  private maxTotalTurns: number
+  private protocolBase: string
+  private protocolAppendix: string
+  private turnDelayMs: number
+  private paused = false
+  private running = false
+  private hiveNames: boolean
   private readonly rootDefaults: Partial<AgentSpec>
+  private tiers: Partial<Record<TierName, ModelAdapter>>
+  private tierWeights: Partial<Record<TierName, number>>
+  /** Every adapter this swarm knows, by name — the pool tiers can draw from. */
+  private readonly adapterPool = new Map<string, ModelAdapter>()
   private readonly onEvent?: (evt: SwarmEvent) => void
   private readonly onTurn?: SwarmOptions['onTurn']
 
@@ -149,10 +241,22 @@ export class Swarm {
     this.adapter = opts.adapter
     this.maxAgents = opts.maxAgents ?? DEFAULT_MAX_AGENTS
     this.maxTotalTurns = opts.maxTotalTurns ?? DEFAULT_MAX_TOTAL_TURNS
-    this.protocol =
-      (opts.protocolPreamble ?? PROTOCOL_PREAMBLE) +
-      (opts.protocolAppendix ? `\n\n${opts.protocolAppendix}` : '')
+    this.protocolBase = opts.protocolPreamble ?? PROTOCOL_PREAMBLE
+    this.protocolAppendix = opts.protocolAppendix ?? ''
+    this.turnDelayMs = opts.turnDelayMs ?? 0
+    this.hiveNames = opts.hiveNames ?? false
     this.rootDefaults = opts.root ?? {}
+    this.tiers = { ...opts.tiers }
+    this.tierWeights = opts.tierWeights ?? {}
+    this.adapterPool.set(opts.adapter.name, opts.adapter)
+    for (const t of TIER_NAMES) {
+      const a = this.tiers[t]
+      if (a !== undefined) this.adapterPool.set(a.name, a)
+    }
+    for (const a of opts.adapters ?? []) this.adapterPool.set(a.name, a)
+    if (this.rootDefaults.adapter) {
+      this.adapterPool.set(this.rootDefaults.adapter.name, this.rootDefaults.adapter)
+    }
     this.onEvent = opts.onEvent
     this.onTurn = opts.onTurn
     this.log = new EventLog(opts.dbPath)
@@ -163,6 +267,112 @@ export class Swarm {
       pinSlots: opts.pinSlots,
       claimTtlMs: opts.claimTtlMs,
     })
+  }
+
+  /** The swarm's effective configuration, for display and inspection. */
+  config(): SwarmConfigView {
+    return {
+      adapter: this.adapter.name,
+      maxAgents: Number.isFinite(this.maxAgents) ? this.maxAgents : null,
+      maxTotalTurns: Number.isFinite(this.maxTotalTurns) ? this.maxTotalTurns : null,
+      turnsTaken: this.turnsTaken,
+      pinSlots: this.board.pinSlots,
+      claimTtlMs: this.board.claimTtlMs,
+      rootName: this.rootDefaults.name ?? 'overseer',
+      rootPrompt: this.rootDefaults.prompt ?? DEFAULT_ROOT_PROMPT,
+      protocol: this.protocol(),
+      protocolAppendix: this.protocolAppendix,
+      paused: this.paused,
+      turnDelayMs: this.turnDelayMs,
+      hiveNames: this.hiveNames,
+      tiers: Object.fromEntries(
+        TIER_NAMES.filter(t => this.tiers[t] !== undefined).map(t => [t, this.tiers[t]!.name]),
+      ),
+      tierWeights: { ...this.tierWeights },
+      availableAdapters: [...this.adapterPool.keys()],
+    }
+  }
+
+  /**
+   * Adjust the run backstops mid-flight. Raising maxTotalTurns extends a
+   * running swarm; setting it at or below turnsTaken halts the run at the
+   * next loop check — a usable soft-stop.
+   */
+  configure(update: SwarmConfigUpdate): SwarmConfigView {
+    if (update.maxAgents !== undefined) {
+      if (update.maxAgents === null) {
+        this.maxAgents = Infinity
+      } else if (!Number.isInteger(update.maxAgents) || update.maxAgents < 1) {
+        throw new Error(`maxAgents must be a positive integer or null (unlimited), got ${update.maxAgents}`)
+      } else {
+        this.maxAgents = update.maxAgents
+      }
+    }
+    if (update.maxTotalTurns !== undefined) {
+      if (update.maxTotalTurns === null) {
+        this.maxTotalTurns = Infinity
+      } else if (!Number.isInteger(update.maxTotalTurns) || update.maxTotalTurns < 0) {
+        throw new Error(
+          `maxTotalTurns must be a non-negative integer or null (unlimited), got ${update.maxTotalTurns}`,
+        )
+      } else {
+        this.maxTotalTurns = update.maxTotalTurns
+      }
+    }
+    if (update.tiers !== undefined) {
+      // Validate the whole batch before applying any of it.
+      const staged: Array<[TierName, ModelAdapter | undefined]> = []
+      for (const t of TIER_NAMES) {
+        const name = update.tiers[t]
+        if (name === undefined) continue
+        if (name === null) {
+          staged.push([t, undefined])
+        } else {
+          const adapter = this.adapterPool.get(name)
+          if (adapter === undefined) {
+            throw new Error(
+              `unknown adapter "${name}" — available: ${[...this.adapterPool.keys()].join(', ')}`,
+            )
+          }
+          staged.push([t, adapter])
+        }
+      }
+      for (const [t, adapter] of staged) {
+        if (adapter === undefined) delete this.tiers[t]
+        else this.tiers[t] = adapter
+      }
+    }
+    if (update.tierWeights !== undefined) {
+      for (const t of TIER_NAMES) {
+        const w = update.tierWeights[t]
+        if (w !== undefined && (typeof w !== 'number' || !Number.isFinite(w) || w < 0)) {
+          throw new Error(`tier weight for "${t}" must be a non-negative number, got ${w}`)
+        }
+      }
+      this.tierWeights = { ...update.tierWeights }
+    }
+    if (update.pinSlots !== undefined) {
+      if (!Number.isInteger(update.pinSlots) || update.pinSlots < 0) {
+        throw new Error(`pinSlots must be a non-negative integer, got ${update.pinSlots}`)
+      }
+      this.board.pinSlots = update.pinSlots
+    }
+    if (update.claimTtlMs !== undefined) {
+      if (!Number.isInteger(update.claimTtlMs) || update.claimTtlMs < 1000) {
+        throw new Error(`claimTtlMs must be an integer >= 1000, got ${update.claimTtlMs}`)
+      }
+      this.board.claimTtlMs = update.claimTtlMs
+    }
+    if (update.paused !== undefined) this.paused = update.paused
+    if (update.turnDelayMs !== undefined) {
+      if (!Number.isInteger(update.turnDelayMs) || update.turnDelayMs < 0) {
+        throw new Error(`turnDelayMs must be a non-negative integer, got ${update.turnDelayMs}`)
+      }
+      this.turnDelayMs = update.turnDelayMs
+    }
+    if (update.protocolAppendix !== undefined) this.protocolAppendix = update.protocolAppendix
+    if (update.hiveNames !== undefined) this.hiveNames = update.hiveNames
+    return this.config()
   }
 
   /** Point-in-time view of the swarm, for UIs and monitoring. */
@@ -178,11 +388,12 @@ export class Swarm {
         lastActivity: s.lastActivity,
         lastActivityAt: s.lastActivityAt,
         summary: s.summary,
-        adapter: (s.spec.adapter ?? this.adapter).name,
+        adapter: s.adapter.name,
+        tier: s.tier,
       })),
       turnsTaken: this.turnsTaken,
-      maxTotalTurns: this.maxTotalTurns,
-      maxAgents: this.maxAgents,
+      maxTotalTurns: Number.isFinite(this.maxTotalTurns) ? this.maxTotalTurns : null,
+      maxAgents: Number.isFinite(this.maxAgents) ? this.maxAgents : null,
       lastEventId: this.log.lastId(),
     }
   }
@@ -192,8 +403,45 @@ export class Swarm {
     state.lastActivityAt = Date.now()
   }
 
+  private protocol(): string {
+    return this.protocolBase + (this.protocolAppendix ? `\n\n${this.protocolAppendix}` : '')
+  }
+
+  /**
+   * The operator's direct line: inject a message into an agent's context.
+   * Wakes the agent if it's idle; the running loop picks it up next pass.
+   * Logged as a tagged system event so the intervention is on the record.
+   */
+  message(agentName: string, text: string): { ok: boolean; error?: string; note?: string } {
+    const state = this.agents.get(agentName)
+    if (state === undefined) {
+      return { ok: false, error: `no agent named "${agentName}" — agents: ${[...this.agents.keys()].join(', ')}` }
+    }
+    if (state.status === 'done') {
+      return { ok: false, error: `agent "${agentName}" has completed and cannot be messaged` }
+    }
+    state.messages.push({
+      role: 'user',
+      content: `(Direct message from the operator — the human running this swarm.)\n${text}`,
+    })
+    if (state.status === 'idle') state.status = 'ready'
+    this.log.append({
+      type: 'system',
+      agent: agentName,
+      channel: null,
+      body: `operator → ${agentName}: ${text}`,
+      tags: ['operator'],
+      refs: [],
+      meta: { operator: true },
+    })
+    this.deliverNewEvents(agentName)
+    return this.running
+      ? { ok: true }
+      : { ok: true, note: 'no run is active — the agent will see this when the swarm runs' }
+  }
+
   spawn(parent: string | null, spec: AgentSpec): { ok: boolean; error?: string } {
-    const result = this.spawnInternal(parent, spec, spec.prompt)
+    const result = this.spawnInternal(parent, spec, spec.prompt, 'code')
     this.deliverNewEvents(null)
     return result
   }
@@ -202,18 +450,32 @@ export class Swarm {
     parent: string | null,
     spec: AgentSpec,
     firstMessage: string,
-  ): { ok: boolean; error?: string } {
+    source: 'code' | 'agent',
+  ): { ok: boolean; error?: string; name?: string } {
     if (this.agents.size >= this.maxAgents) {
       return { ok: false, error: `max agents (${this.maxAgents}) reached` }
+    }
+    if (source === 'agent' && this.hiveNames) {
+      spec = { ...spec, name: generateAgentName(this.agents.keys()) }
     }
     if (this.agents.has(spec.name)) {
       return { ok: false, error: `agent "${spec.name}" already exists` }
     }
 
+    let resolved: { adapter: ModelAdapter; tier: TierName | null }
+    try {
+      resolved = this.resolveAdapter(spec, source)
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+    this.adapterPool.set(resolved.adapter.name, resolved.adapter)
+
     this.agents.set(spec.name, {
       spec,
       status: 'ready',
       parent,
+      adapter: resolved.adapter,
+      tier: resolved.tier,
       turns: 0,
       lastActivity: 'spawned',
       lastActivityAt: Date.now(),
@@ -231,9 +493,52 @@ export class Swarm {
       body: `${spec.role}: ${promptSummary}`,
       tags: [],
       refs: [],
-      meta: { parent },
+      meta: { parent, tier: resolved.tier, adapter: resolved.adapter.name },
     })
-    return { ok: true }
+    return { ok: true, name: spec.name }
+  }
+
+  /**
+   * spec.adapter wins; then a named tier; then — for agent-initiated spawns
+   * only — weighted sampling; then the swarm default. Code-level spawns
+   * (run(), swarm.spawn()) never get sampled: the weights model a *spawning
+   * agent* declining to choose, and code callers can just say what they want.
+   */
+  private resolveAdapter(
+    spec: AgentSpec,
+    source: 'code' | 'agent',
+  ): { adapter: ModelAdapter; tier: TierName | null } {
+    if (spec.adapter) return { adapter: spec.adapter, tier: spec.tier ?? null }
+
+    if (spec.tier !== undefined) {
+      const adapter = this.tiers[spec.tier]
+      if (adapter === undefined) {
+        const configured = TIER_NAMES.filter(t => this.tiers[t] !== undefined)
+        throw new Error(
+          configured.length === 0
+            ? `tier "${spec.tier}" requested but this swarm has no tiers configured — omit tier`
+            : `unknown tier "${spec.tier}" — configured tiers: ${configured.join(', ')}`,
+        )
+      }
+      return { adapter, tier: spec.tier }
+    }
+
+    const weighted =
+      source === 'code'
+        ? []
+        : TIER_NAMES.filter(t => this.tiers[t] !== undefined && (this.tierWeights[t] ?? 0) > 0)
+    if (weighted.length > 0) {
+      const total = weighted.reduce((sum, t) => sum + this.tierWeights[t]!, 0)
+      let roll = Math.random() * total
+      for (const t of weighted) {
+        roll -= this.tierWeights[t]!
+        if (roll <= 0) return { adapter: this.tiers[t]!, tier: t }
+      }
+      const last = weighted[weighted.length - 1]!
+      return { adapter: this.tiers[last]!, tier: last }
+    }
+
+    return { adapter: this.adapter, tier: null }
   }
 
   async run(task: string, root?: Partial<AgentSpec>): Promise<SwarmResult> {
@@ -244,26 +549,38 @@ export class Swarm {
       subscriptions: root?.subscriptions ?? this.rootDefaults.subscriptions,
       adapter: root?.adapter ?? this.rootDefaults.adapter,
     }
-    const spawned = this.spawnInternal(null, rootSpec, task)
+    const spawned = this.spawnInternal(null, rootSpec, task, 'code')
     if (!spawned.ok) throw new Error(`failed to spawn root agent: ${spawned.error}`)
     this.deliverNewEvents(null)
 
     const finalSummaries: Record<string, string> = {}
 
-    outer: while (this.turnsTaken < this.maxTotalTurns) {
-      // Idle agents with queued wakes become ready again.
-      for (const state of this.agents.values()) {
-        if (state.status === 'idle' && state.wakes.length > 0) state.status = 'ready'
-      }
-      const ready = [...this.agents.values()].filter(s => s.status === 'ready')
-      if (ready.length === 0) break
+    this.running = true
+    try {
+      outer: while (true) {
+        // Paused swarms hold here — no turns, and no termination either, so
+        // an operator can pause, message agents, and resume.
+        while (this.paused) await sleep(150)
+        if (this.turnsTaken >= this.maxTotalTurns) break
 
-      for (const state of ready) {
-        if (this.turnsTaken >= this.maxTotalTurns) break outer
-        if (state.status !== 'ready') continue
-        const summary = await this.takeTurn(state)
-        if (summary !== null) finalSummaries[state.spec.name] = summary
+        // Idle agents with queued wakes become ready again.
+        for (const state of this.agents.values()) {
+          if (state.status === 'idle' && state.wakes.length > 0) state.status = 'ready'
+        }
+        const ready = [...this.agents.values()].filter(s => s.status === 'ready')
+        if (ready.length === 0) break
+
+        for (const state of ready) {
+          while (this.paused) await sleep(150)
+          if (this.turnsTaken >= this.maxTotalTurns) break outer
+          if (state.status !== 'ready') continue
+          if (this.turnDelayMs > 0) await sleep(this.turnDelayMs)
+          const summary = await this.takeTurn(state)
+          if (summary !== null) finalSummaries[state.spec.name] = summary
+        }
       }
+    } finally {
+      this.running = false
     }
 
     return {
@@ -286,7 +603,7 @@ export class Swarm {
     this.setActivity(state, 'thinking…')
     let result: TurnResult
     try {
-      result = await (state.spec.adapter ?? this.adapter).turn({
+      result = await state.adapter.turn({
         system: this.buildSystemPrompt(state.spec),
         messages: state.messages,
         tools: toolDefs,
@@ -407,7 +724,7 @@ export class Swarm {
         log: this.log,
         // spawnInternal, not spawn: wake fan-out for the spawned event happens
         // once, at end of turn, with the acting-agent exclusion applied.
-        spawn: (parent, spec) => this.spawnInternal(parent, spec, spec.prompt),
+        spawn: (parent, spec) => this.spawnInternal(parent, spec, spec.prompt, 'agent'),
         addSubscription: (agentName, filter) => {
           this.agents.get(agentName)?.subscriptions.push(filter)
         },
@@ -498,7 +815,7 @@ export class Swarm {
 
   private buildSystemPrompt(spec: AgentSpec): string {
     let prompt =
-      this.protocol +
+      this.protocol() +
       `\n\nYour name is "${spec.name}". Your role: ${spec.role}.\n\n` +
       spec.prompt
     const pins = this.board.pins()
@@ -515,6 +832,10 @@ export class Swarm {
     }
     return prompt
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 function describeToolCalls(calls: ToolCall[]): string {

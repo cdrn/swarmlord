@@ -15,7 +15,7 @@ import { generateAgentName } from './names.js'
 export interface VerbContext {
   board: Blackboard
   log: EventLog
-  spawn(parent: string, spec: AgentSpec): { ok: boolean; error?: string }
+  spawn(parent: string, spec: AgentSpec): { ok: boolean; error?: string; name?: string }
   addSubscription(agentName: string, filter: SubscriptionFilter): void
   /** Names of all agents currently in the swarm (for name generation). */
   agentNames(): string[]
@@ -217,6 +217,17 @@ export const toolDefs: ToolDef[] = [
         name: {
           type: 'string',
           description: 'Unique agent name. Omit to have one generated.',
+        },
+        tier: {
+          type: 'string',
+          enum: ['heavy', 'standard', 'light'],
+          description:
+            'Model class for the new agent, when the swarm has tiers configured. ' +
+            'heavy: most capable and most expensive — deep synthesis, judgment calls, final outputs. ' +
+            'standard: everyday work. ' +
+            'light: fast and cheap — scanning, formatting, mechanical subtasks. ' +
+            "Match the tier to the work: don't burn heavy on a listing job, don't send light to synthesize. " +
+            'Omit to let the swarm default decide.',
         },
         role: { type: 'string', description: 'Short role, e.g. "researcher".' },
         prompt: { type: 'string', description: 'Role instructions; delivered as its first message.' },
@@ -462,15 +473,20 @@ export function executeVerb(ctx: VerbContext, agentName: string, call: ToolCall)
           return err({ spawned: false, error: `each ${EMPTY_FILTER_ERROR}` })
         }
         const requestedName = typeof input.name === 'string' ? input.name.trim() : ''
+        const tier =
+          input.tier === 'heavy' || input.tier === 'standard' || input.tier === 'light'
+            ? input.tier
+            : undefined
         const spec: AgentSpec = {
           name: requestedName !== '' ? requestedName : generateAgentName(ctx.agentNames()),
           role: reqString(input, 'role'),
           prompt: reqString(input, 'prompt'),
           subscriptions,
+          tier,
         }
         const result = ctx.spawn(agentName, spec)
         if (!result.ok) return err({ spawned: false, error: result.error })
-        return ok({ spawned: true, name: spec.name })
+        return ok({ spawned: true, name: result.name ?? spec.name })
       }
 
       case 'idle': {

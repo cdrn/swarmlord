@@ -55,8 +55,9 @@ function jaccard(a: Set<string>, b: Set<string>): number {
 
 export class Blackboard {
   private readonly log: EventLog
-  private readonly pinSlots: number
-  private readonly claimTtlMs: number
+  /** Mutable: the runtime's configure() can retune these live. */
+  pinSlots: number
+  claimTtlMs: number
 
   constructor(log: EventLog, opts: BoardOptions = {}) {
     this.log = log

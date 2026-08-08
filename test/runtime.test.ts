@@ -419,4 +419,205 @@ describe('Swarm runtime', () => {
     expect(result.turns).toBe(2)
     expect(swarm.snapshot().agents[0]?.status).toBe('idle')
   })
+
+  it('resolves spawn tiers to tier adapters and samples weights when tier is omitted', async () => {
+    const seenBy: Record<string, string[]> = { root: [], heavy: [], light: [] }
+    const agentIn = (req: TurnRequest) => /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+    const tierAdapter = (label: string) => {
+      const a = new MockAdapter(req => {
+        seenBy[label]!.push(agentIn(req))
+        return turnOf([{ name: 'complete', input: { summary: label } }])
+      })
+      Object.defineProperty(a, 'name', { value: label })
+      return a
+    }
+
+    let rootTurns = 0
+    const rootAdapter = new MockAdapter(req => {
+      seenBy.root!.push(agentIn(req))
+      rootTurns++
+      if (rootTurns === 1) {
+        return turnOf([
+          { name: 'spawn', input: { name: 'hv', tier: 'heavy', role: 'synth', prompt: 'think hard' } },
+          { name: 'spawn', input: { name: 'anon', role: 'scout', prompt: 'look around' } },
+        ])
+      }
+      return turnOf([{ name: 'complete', input: { summary: 'root done' } }])
+    })
+
+    const swarm = new Swarm({
+      adapter: rootAdapter,
+      tiers: { heavy: tierAdapter('heavy'), light: tierAdapter('light') },
+      // Only light is weighted, so tier-less spawns deterministically land there.
+      tierWeights: { light: 1 },
+      maxTotalTurns: 20,
+    })
+    await swarm.run('tier test')
+
+    expect(seenBy.heavy).toContain('hv')
+    expect(seenBy.light).toContain('anon')
+    expect(seenBy.root).not.toContain('hv')
+    expect(seenBy.root).not.toContain('anon')
+
+    const byName = Object.fromEntries(swarm.snapshot().agents.map(a => [a.name, a]))
+    expect(byName.hv?.tier).toBe('heavy')
+    expect(byName.hv?.adapter).toBe('heavy')
+    expect(byName.anon?.tier).toBe('light')
+    expect(byName.overseer?.tier).toBeNull()
+
+    expect(swarm.config().tiers).toEqual({ heavy: 'heavy', light: 'light' })
+  })
+
+  it('surfaces a tool-result error when spawning into an unconfigured tier', async () => {
+    let n = 0
+    let tierError: string | null = null
+    const adapter = new MockAdapter(req => {
+      n++
+      if (n === 1) {
+        return turnOf([
+          { name: 'spawn', input: { name: 'x', tier: 'heavy', role: 'r', prompt: 'p' } },
+        ])
+      }
+      for (const m of req.messages) {
+        if (m.role === 'tool_results' && m.results[0]?.isError) tierError = m.results[0].content
+      }
+      return turnOf([{ name: 'complete', input: { summary: 'done' } }])
+    })
+
+    const swarm = new Swarm({ adapter, maxTotalTurns: 10 })
+    const result = await swarm.run('no tiers here')
+
+    expect(tierError).not.toBeNull()
+    expect(tierError!).toContain('no tiers configured')
+    expect(result.agents).not.toContain('x')
+  })
+
+  it('delivers operator messages mid-run and wakes the idle target', async () => {
+    let swarm: Swarm
+    const rootTurns: string[] = []
+    let sawOperatorMessage = false
+
+    const adapter = new MockAdapter(req => {
+      const name = /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+      if (name === 'overseer') {
+        rootTurns.push('turn')
+        if (rootTurns.length === 1) {
+          return turnOf([
+            { name: 'subscribe', input: { tags: ['never-fires'] } },
+            { name: 'spawn', input: { name: 'runner', role: 'worker', prompt: 'do a lap' } },
+            { name: 'idle', input: {} },
+          ])
+        }
+        sawOperatorMessage = req.messages.some(
+          m => m.role === 'user' && m.content.includes('Direct message from the operator'),
+        )
+        return turnOf([{ name: 'complete', input: { summary: 'steered' } }])
+      }
+      // The worker's turn happens mid-run — inject the operator message here.
+      swarm.message('overseer', 'change course: wrap up now')
+      return turnOf([{ name: 'complete', input: { summary: 'lap done' } }])
+    })
+
+    swarm = new Swarm({ adapter, maxTotalTurns: 10 })
+    const result = await swarm.run('operator steering test')
+
+    expect(sawOperatorMessage).toBe(true)
+    expect(result.finalSummaries.overseer).toBe('steered')
+    const opEvents = swarm.log.query({ types: ['system'], tagsAny: ['operator'] })
+    expect(opEvents.some(e => e.body.includes('operator → overseer'))).toBe(true)
+  })
+
+  it('lifts caps via null and reassigns tiers from the adapter pool', () => {
+    const spare = new MockAdapter(() => turnOf([]))
+    Object.defineProperty(spare, 'name', { value: 'spare-model' })
+    const lightA = new MockAdapter(() => turnOf([]))
+    Object.defineProperty(lightA, 'name', { value: 'light-model' })
+
+    const swarm = new Swarm({
+      adapter: new MockAdapter(() => turnOf([])),
+      tiers: { light: lightA },
+      adapters: [spare],
+      maxAgents: 2,
+    })
+
+    expect(swarm.config().availableAdapters).toEqual(
+      expect.arrayContaining(['mock', 'light-model', 'spare-model']),
+    )
+
+    // Cap of 2: root slot is free, so agents 3+ would normally be refused.
+    swarm.spawn(null, { name: 'a1', role: 'r', prompt: 'p' })
+    swarm.spawn(null, { name: 'a2', role: 'r', prompt: 'p' })
+    expect(swarm.spawn(null, { name: 'a3', role: 'r', prompt: 'p' }).ok).toBe(false)
+
+    const lifted = swarm.configure({ maxAgents: null, maxTotalTurns: null })
+    expect(lifted.maxAgents).toBeNull()
+    expect(lifted.maxTotalTurns).toBeNull()
+    expect(swarm.spawn(null, { name: 'a3', role: 'r', prompt: 'p' }).ok).toBe(true)
+    expect(swarm.snapshot().maxAgents).toBeNull()
+
+    // Tier reassignment by adapter name, batch-validated.
+    expect(swarm.configure({ tiers: { heavy: 'spare-model' } }).tiers.heavy).toBe('spare-model')
+    expect(() => swarm.configure({ tiers: { heavy: 'nope' } })).toThrow(/available:/)
+    expect(swarm.config().tiers.heavy).toBe('spare-model')
+    expect(swarm.configure({ tiers: { light: null } }).tiers.light).toBeUndefined()
+  })
+
+  it('configure() acts as a soft stop when maxTotalTurns drops below turnsTaken', async () => {
+    let swarm: Swarm
+    let n = 0
+    const adapter = new MockAdapter(() => {
+      n++
+      if (n === 1) {
+        return turnOf([
+          { name: 'create_channel', input: { name: 'work', purpose: 'busywork', tags: [] } },
+        ])
+      }
+      if (n === 3) swarm.configure({ maxTotalTurns: 0 })
+      // Never idles, never completes — only the backstop can stop this agent.
+      return turnOf([{ name: 'post', input: { channel: 'work', body: `busy turn ${n}` } }])
+    })
+
+    swarm = new Swarm({ adapter, maxTotalTurns: 50 })
+    const result = await swarm.run('spin forever')
+
+    expect(result.turns).toBe(3)
+    expect(swarm.config().maxTotalTurns).toBe(0)
+  })
+
+  it('hiveNames overrides agent-picked spawn names but keeps code-level ones', async () => {
+    let rootTurns = 0
+    let spawnResults: Array<{ toolCallId: string; content: string; isError?: boolean }> | null =
+      null
+    const adapter = new MockAdapter(req => {
+      if (isAgent(req, 'ROLE:root')) {
+        rootTurns++
+        if (rootTurns === 1) {
+          return turnOf([
+            { name: 'spawn', input: { name: 'my-picked-name', role: 'w', prompt: 'p' } },
+          ])
+        }
+        for (const m of req.messages) {
+          if (m.role === 'tool_results') spawnResults = m.results
+        }
+        return turnOf([{ name: 'complete', input: { summary: 'root done' } }])
+      }
+      return turnOf([{ name: 'complete', input: { summary: 'worker done' } }])
+    })
+
+    const swarm = new Swarm({ adapter, hiveNames: true, maxTotalTurns: 20 })
+    swarm.spawn(null, { name: 'kept', role: 'w', prompt: 'p' })
+    const result = await swarm.run('name test', { prompt: 'ROLE:root spawn one' })
+
+    // The agent-requested name was replaced by a generated hive name...
+    expect(result.agents).not.toContain('my-picked-name')
+    expect(swarm.snapshot().agents.map(a => a.name)).not.toContain('my-picked-name')
+    // ...and the spawn tool result reported the generated name back.
+    expect(spawnResults).not.toBeNull()
+    const payload = JSON.parse(spawnResults![0]!.content) as { spawned: boolean; name: string }
+    expect(payload.spawned).toBe(true)
+    expect(payload.name).not.toBe('my-picked-name')
+    expect(result.agents).toContain(payload.name)
+    // Code-level spawns keep the name they were given.
+    expect(result.agents).toContain('kept')
+  })
 })

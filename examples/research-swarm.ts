@@ -42,6 +42,16 @@ async function main(): Promise<void> {
 
   const swarm = new Swarm({
     adapter: new AnthropicAdapter(),
+    // Three castes: the spawner picks a tier per spawn (the verb teaches
+    // when); tier-less spawns sample the weights below. Tiers are
+    // reassignable at runtime from the viewer's settings drawer.
+    tiers: {
+      heavy: new AnthropicAdapter({ model: 'claude-fable-5' }),
+      standard: new AnthropicAdapter({ model: 'claude-sonnet-4-6' }),
+      light: new AnthropicAdapter({ model: 'claude-haiku-4-5' }),
+    },
+    tierWeights: { standard: 3, light: 1 },
+    hiveNames: true,
     maxAgents: 8,
     maxTotalTurns: 40,
     onEvent: printEvent,

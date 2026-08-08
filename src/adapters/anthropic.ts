@@ -101,7 +101,8 @@ export function parseResponse(response: Anthropic.Message): TurnResult {
 }
 
 export class AnthropicAdapter implements ModelAdapter {
-  readonly name = 'anthropic'
+  /** Includes the model so mixed-tier swarms are tellable apart in snapshots. */
+  readonly name: string
 
   private readonly client: Anthropic
   private readonly model: string
@@ -112,6 +113,7 @@ export class AnthropicAdapter implements ModelAdapter {
     this.client = opts.apiKey !== undefined ? new Anthropic({ apiKey: opts.apiKey }) : new Anthropic()
     this.model = opts.model ?? DEFAULT_MODEL
     this.maxTokens = opts.maxTokens ?? DEFAULT_MAX_TOKENS
+    this.name = `anthropic:${this.model}`
   }
 
   async turn(req: TurnRequest): Promise<TurnResult> {

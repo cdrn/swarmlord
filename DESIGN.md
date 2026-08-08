@@ -44,14 +44,16 @@ src/
   core/verbs.ts          # tool defs + dispatcher (the agent-facing verbs)
   core/names.ts          # generateAgentName — hive-flavored names for unnamed spawns
   core/runtime.ts        # Swarm — scheduling, spawning, subscription wakes
-  viewer/ui.ts           # VIEWER_HTML — single-file dashboard page
-  viewer/server.ts       # startViewer — node:http server + SSE over the log
+  viewer/ui.ts           # VIEWER_HTML — single-file page, hive home + swarm dashboard
+  viewer/server.ts       # startViewer + startHive — node:http server + SSE over the log
   adapters/types.ts      # ModelAdapter neutral interface                   (DONE)
   adapters/anthropic.ts  # Claude adapter (@anthropic-ai/sdk)
   adapters/mock.ts       # scripted adapter for tests/offline demo
   patterns/librarian.ts  # curator role built on the public verbs
+  hive.ts                # Hive — durable multi-swarm manager over a directory of dbs
   index.ts               # public re-exports
 examples/research-swarm.ts
+examples/hive.ts         # the hive console demo
 test/*.test.ts
 ```
 
@@ -151,6 +153,9 @@ export interface SwarmOptions {
   root?: Partial<AgentSpec>    // overseer defaults; run()'s root arg overrides field-by-field
   protocolPreamble?: string    // replaces the exported PROTOCOL_PREAMBLE
   protocolAppendix?: string    // appended after the preamble — house rules
+  tiers?: Partial<Record<'heavy' | 'standard' | 'light', ModelAdapter>>  // model castes
+  tierWeights?: Partial<Record<'heavy' | 'standard' | 'light', number>>  // sampling for tier-less agent spawns
+  hiveNames?: boolean       // agent-initiated spawns always get generated hive names (vexeth, skarnix, ...)
   onEvent?: (evt: SwarmEvent) => void   // fires for every appended event
   onTurn?: (info: { agent: string; turn: number; text: string; toolCalls: ToolCall[] }) => void
 }
@@ -158,6 +163,13 @@ export interface SwarmOptions {
 // PROTOCOL_PREAMBLE and DEFAULT_ROOT_PROMPT are exported for composition.
 // The idle verb refuses when the agent has zero subscriptions (only a pin
 // could ever wake it) — it must subscribe first or call complete.
+//
+// Tier resolution, per spawn: spec.adapter > tiers[spec.tier] (unknown tier
+// errors back to the spawner) > weighted sample of tierWeights — agent-
+// initiated spawns only; code-level spawns never sample > swarm default.
+// The spawn verb exposes tier ('heavy'|'standard'|'light') and teaches the
+// trade-off in its description. Snapshots and spawned-event meta carry the
+// resolved tier + adapter name.
 
 export interface SwarmResult {
   turns: number
@@ -172,6 +184,10 @@ export class Swarm {
   readonly board: Blackboard
   spawn(parent: string | null, spec: AgentSpec): { ok: boolean; error?: string }
   run(task: string, root?: Partial<AgentSpec>): Promise<SwarmResult>
+  // Operator direct line: inject a message into an agent's context, delivered
+  // (labeled as from the human operator) before its next turn. Wakes idlers;
+  // refuses for unknown or completed agents.
+  message(agentName: string, text: string): { ok: boolean; error?: string; note?: string }
 }
 ```
 
@@ -278,3 +294,70 @@ HTTP endpoints:
 | `GET /api/state` | JSON `{ snapshot: SwarmSnapshot, channels: ChannelInfo[], pins: Array<{eventId: number, agent: string}> }` |
 | `GET /api/events?since_id=N&limit=M` | JSON `SwarmEvent[]` (defaults `since_id=0`, `limit=200`) |
 | `GET /api/stream` | SSE. Every ~400ms an `event: tick` whose data is JSON `{ state: <same shape as /api/state>, events: SwarmEvent[] }`, where `events` are the log entries appended since this connection's cursor. The cursor starts at the `since_id` query param (default: current `lastId` — the UI fetches history via `/api/events` first). |
+
+## Hive
+
+Multi-swarm management (`src/hive.ts`). Each swarm is a sqlite event log on
+disk plus a metadata record in `<dir>/hive.json`; the Hive creates, stops,
+archives, and deletes them. Finished and archived swarms stay inspectable —
+the log is the artifact — so `hive.swarm(id)` lazily opens a view over a past
+run's database (board and log readable; the in-memory agent roster of past
+runs is gone, the events are not).
+
+```ts
+export interface HiveOptions {
+  dir: string                              // swarm databases + the hive.json index
+  createSwarm: (dbPath: string) => Swarm   // factory: fully-configured Swarm over a db path
+}
+
+export interface SwarmRecord {
+  id: string                    // slug of the title; doubles as the db filename
+  title: string
+  task: string | null
+  status: 'active' | 'archived'
+  createdAt: number
+  running: boolean              // live in this process right now
+  result: { turns: number; agents: number; events: number } | null
+  error: string | null
+}
+
+export class Hive {
+  constructor(opts: HiveOptions)
+  list(): SwarmRecord[]                 // newest first
+  get(id: string): SwarmRecord | null
+  swarm(id: string): Swarm | null       // live instance when running, else lazily-opened view
+  create(title: string, task: string): SwarmRecord   // creates AND starts the run; returns immediately
+  stop(id: string): SwarmRecord         // soft-stop: maxTotalTurns → 0, the loop winds down
+  archive(id: string): SwarmRecord      // throws while running
+  unarchive(id: string): SwarmRecord
+  delete(id: string): void              // removes record AND database; throws while running
+  settled(id: string): Promise<void>    // resolves when the run (if any) settles; mostly for tests
+}
+```
+
+### Hive server — frozen HTTP contract
+
+```ts
+// src/viewer/server.ts
+export function startHive(hive: Hive, opts?: ViewerOptions): Promise<ViewerHandle>
+```
+
+The same `VIEWER_HTML` serves both modes. The UI detects mode by probing
+`GET /api/swarms`: 200 → hive mode (home screen), 404 → single-swarm mode
+(the existing dashboard at base `''`).
+
+| endpoint | response |
+|---|---|
+| `GET /api/swarms` | `SwarmRecord[]` |
+| `POST /api/swarms` `{title?, task}` | `SwarmRecord` — creates AND starts the run; 400 if `task` missing/empty |
+| `POST /api/swarms/<id>/stop` | `SwarmRecord` (soft-stop) |
+| `POST /api/swarms/<id>/archive` | `SwarmRecord`; 400 `{error}` if running |
+| `POST /api/swarms/<id>/unarchive` | `SwarmRecord` |
+| `DELETE /api/swarms/<id>` | 204; 400 `{error}` if running |
+
+Per-swarm routes are the single-swarm API prefixed under `/s/<id>`:
+`/s/<id>/api/state`, `/s/<id>/api/events`, `/s/<id>/api/stream`,
+`/s/<id>/api/config` (GET+POST), `/s/<id>/api/message` (POST) — identical
+semantics to the existing single-swarm routes, resolved via `hive.swarm(id)`;
+unknown ids answer 404 `{error}`. `GET /`, `/assets/swarmlord.png`, and
+`/api/ui-hash` stay global.
