@@ -19,6 +19,8 @@ export interface VerbContext {
   addSubscription(agentName: string, filter: SubscriptionFilter): void
   /** Names of all agents currently in the swarm (for name generation). */
   agentNames(): string[]
+  /** The agent's current standing queries (for the no-subscription idle guard). */
+  subscriptionsOf(agentName: string): SubscriptionFilter[]
 }
 
 export interface VerbResult {
@@ -473,6 +475,19 @@ export function executeVerb(ctx: VerbContext, agentName: string, call: ToolCall)
 
       case 'idle': {
         const reason = typeof input.reason === 'string' ? input.reason : ''
+        // Idling with no subscriptions is almost always a mistake: nothing
+        // (except a pin) can ever wake this agent, and the run may end with
+        // its work unfinished. Refuse so the agent self-corrects.
+        if (ctx.subscriptionsOf(agentName).length === 0) {
+          return err({
+            idling: false,
+            error:
+              'You have no subscriptions — nothing would ever wake you. ' +
+              'Call subscribe first (e.g. to the channels your workers post to, or ' +
+              "types: ['agent_done'] to wake when they finish), then idle. " +
+              'If your work is actually finished, call complete instead.',
+          })
+        }
         ctx.log.append({
           type: 'agent_idle',
           agent: agentName,

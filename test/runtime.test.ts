@@ -320,4 +320,103 @@ describe('Swarm runtime', () => {
     const systemEvents = swarm.log.query({ types: ['system'] })
     expect(systemEvents.some(e => e.agent === 'w1' && e.body.includes('simulated 500'))).toBe(true)
   })
+
+  it('uses SwarmOptions.root as overseer defaults, overridden field-by-field by run()', async () => {
+    let seenSystem = ''
+    const adapter = new MockAdapter(req => {
+      seenSystem = req.system
+      return turnOf([{ name: 'complete', input: { summary: 'done' } }])
+    })
+
+    const swarm = new Swarm({
+      adapter,
+      root: { name: 'hive-tyrant', role: 'synapse', prompt: 'ROLE:tyrant command the brood' },
+    })
+    const result = await swarm.run('task', { role: 'warlord' })
+
+    expect(result.agents).toContain('hive-tyrant')      // from options.root
+    expect(seenSystem).toContain('Your role: warlord')  // run() arg wins
+    expect(seenSystem).toContain('ROLE:tyrant')         // prompt from options.root
+  })
+
+  it('applies protocolPreamble and protocolAppendix to every agent system prompt', async () => {
+    const systems: string[] = []
+    const adapter = new MockAdapter(req => {
+      systems.push(req.system)
+      return turnOf([{ name: 'complete', input: { summary: 'done' } }])
+    })
+
+    const swarm = new Swarm({
+      adapter,
+      protocolPreamble: 'CUSTOM-PROTOCOL: obey the hive mind.',
+      protocolAppendix: 'HOUSE-RULE: post in lowercase.',
+    })
+    await swarm.run('task')
+
+    expect(systems[0]).toContain('CUSTOM-PROTOCOL: obey the hive mind.')
+    expect(systems[0]).toContain('HOUSE-RULE: post in lowercase.')
+    expect(systems[0]).not.toContain('You are one agent in a swarm')
+  })
+
+  it('routes turns through a per-agent adapter override and reports it in snapshots', async () => {
+    const defaultCalls: string[] = []
+    const scoutCalls: string[] = []
+    const name = (req: TurnRequest) => /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+
+    const defaultAdapter = new MockAdapter(req => {
+      defaultCalls.push(name(req))
+      const n = defaultCalls.filter(a => a === name(req)).length
+      if (name(req) === 'overseer' && n === 1) {
+        return turnOf([{ name: 'idle', input: {} }])
+      }
+      return turnOf([{ name: 'complete', input: { summary: 'done' } }])
+    })
+    const scoutAdapter = new MockAdapter(req => {
+      scoutCalls.push(name(req))
+      return turnOf([{ name: 'complete', input: { summary: 'scouted' } }])
+    })
+    Object.defineProperty(scoutAdapter, 'name', { value: 'scout-model' })
+
+    const swarm = new Swarm({ adapter: defaultAdapter, maxTotalTurns: 10 })
+    swarm.spawn(null, { name: 'scout', role: 'scout', prompt: 'scout it', adapter: scoutAdapter })
+    const result = await swarm.run('task')
+
+    expect(scoutCalls).toContain('scout')
+    expect(defaultCalls).not.toContain('scout')
+    expect(result.finalSummaries.scout).toBe('scouted')
+
+    const frames = swarm.snapshot().agents
+    expect(frames.find(a => a.name === 'scout')?.adapter).toBe('scout-model')
+    expect(frames.find(a => a.name === 'overseer')?.adapter).toBe('mock')
+  })
+
+  it('refuses idle when the agent has no subscriptions, allows it after subscribing', async () => {
+    let n = 0
+    let idleRefusal: string | null = null
+    const adapter = new MockAdapter(req => {
+      n++
+      if (n === 1) return turnOf([{ name: 'idle', input: { reason: 'waiting' } }])
+      for (const m of req.messages) {
+        if (m.role === 'tool_results' && m.results[0]?.isError) {
+          idleRefusal = m.results[0].content
+        }
+      }
+      if (n === 2) {
+        return turnOf([
+          { name: 'subscribe', input: { channels: ['findings'] } },
+          { name: 'idle', input: { reason: 'waiting properly now' } },
+        ])
+      }
+      return turnOf([{ name: 'complete', input: { summary: 'unreachable' } }])
+    })
+
+    const swarm = new Swarm({ adapter, maxTotalTurns: 10 })
+    const result = await swarm.run('wait for things')
+
+    expect(idleRefusal).not.toBeNull()
+    expect(idleRefusal!).toContain('no subscriptions')
+    // Second idle (with a subscription) succeeded: agent parked, run ended.
+    expect(result.turns).toBe(2)
+    expect(swarm.snapshot().agents[0]?.status).toBe('idle')
+  })
 })

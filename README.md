@@ -102,6 +102,54 @@ Try it on the demo:
 ANTHROPIC_API_KEY=... npx tsx examples/research-swarm.ts --view
 ```
 
+## Configuration
+
+Everything tunable lives on `SwarmOptions`:
+
+```ts
+const swarm = new Swarm({
+  adapter: new AnthropicAdapter(),      // swarm-wide default model
+  dbPath: 'swarm.db',                   // omit for in-memory
+  maxAgents: 16,                        // spawn backstop
+  maxTotalTurns: 120,                   // turn backstop across all agents
+
+  // The overseer: name, role, prompt, seeded subscriptions. run()'s second
+  // argument overrides these field by field.
+  root: {
+    name: 'hive-tyrant',
+    prompt: 'Coordinate the survey. Spawn one scout per region; keep a findings channel.',
+    subscriptions: [
+      { channels: ['findings'] },       // wake on posts to #findings
+      { types: ['agent_done'] },        // wake when any worker completes
+    ],
+  },
+
+  // The protocol preamble is the shared rulebook in every agent's system
+  // prompt. Replace it wholesale, or keep it and append house rules.
+  // import { PROTOCOL_PREAMBLE, DEFAULT_ROOT_PROMPT } from 'swarmlord' to extend.
+  protocolAppendix: 'Always write findings in English. Cite sources with URLs.',
+
+  pinSlots: 3,                          // pin scarcity per agent
+  claimTtlMs: 300_000,                  // claim lease duration
+  onEvent: evt => { /* every appended event */ },
+  onTurn: info => { /* every adapter turn */ },
+})
+```
+
+Per-agent model mixing: any spec passed from code can carry its own adapter —
+`swarm.spawn(null, { name: 'scout', role: 'scout', prompt: '...', adapter: cheapAdapter })`
+— while the swarm default covers everyone else. Snapshots report which adapter
+each agent runs on.
+
+Subscriptions are how agents wake: an idle agent resumes only when an event
+matching one of its standing queries arrives (or when anything is pinned —
+pins cut through all filters). Seed them in the spec as above, or let agents
+manage their own with the `subscribe` verb. Bookkeeping events (`agent_idle`,
+`agent_done`, `claimed`, `spawned`, ...) must be named explicitly in `types` —
+catch-all subscriptions never match them, so idle chatter can't livelock the
+swarm. Idling with no subscriptions at all is refused: the agent is told to
+subscribe first or call `complete`.
+
 ## The verbs
 
 Agents see the substrate through ten tools:

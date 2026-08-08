@@ -138,6 +138,7 @@ export interface AgentSpec {
   role: string          // short human-readable role, e.g. 'researcher'
   prompt: string        // role instructions appended to the protocol system prompt
   subscriptions?: SubscriptionFilter[]
+  adapter?: ModelAdapter  // per-agent model override; code-only, unreachable from the spawn verb
 }
 
 export interface SwarmOptions {
@@ -147,9 +148,16 @@ export interface SwarmOptions {
   maxTotalTurns?: number    // default 200 (across all agents)
   pinSlots?: number
   claimTtlMs?: number
+  root?: Partial<AgentSpec>    // overseer defaults; run()'s root arg overrides field-by-field
+  protocolPreamble?: string    // replaces the exported PROTOCOL_PREAMBLE
+  protocolAppendix?: string    // appended after the preamble — house rules
   onEvent?: (evt: SwarmEvent) => void   // fires for every appended event
   onTurn?: (info: { agent: string; turn: number; text: string; toolCalls: ToolCall[] }) => void
 }
+
+// PROTOCOL_PREAMBLE and DEFAULT_ROOT_PROMPT are exported for composition.
+// The idle verb refuses when the agent has zero subscriptions (only a pin
+// could ever wake it) — it must subscribe first or call complete.
 
 export interface SwarmResult {
   turns: number

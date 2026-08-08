@@ -32,7 +32,15 @@ export const VIEWER_HTML: string = `<!doctype html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
   body {
-    background: var(--bg);
+    /* creep: biomass bleeding in from the corners, very low contrast */
+    background:
+      radial-gradient(1100px 700px at 0% 0%,   rgba(94, 44, 128, 0.14), transparent 62%),
+      radial-gradient(900px 620px at 100% 100%, rgba(225, 63, 174, 0.07), transparent 60%),
+      radial-gradient(760px 520px at 100% 0%,   rgba(63, 140, 47, 0.05), transparent 58%),
+      radial-gradient(820px 560px at 0% 100%,   rgba(125, 255, 94, 0.045), transparent 58%),
+      radial-gradient(340px 200px at 6% 97%,    rgba(125, 255, 94, 0.05), transparent 72%),
+      radial-gradient(300px 220px at 97% 4%,    rgba(225, 63, 174, 0.05), transparent 72%),
+      var(--bg);
     color: var(--text);
     font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace;
     font-size: 13px;
@@ -48,23 +56,61 @@ export const VIEWER_HTML: string = `<!doctype html>
     z-index: 99;
   }
 
-  /* ---- header ---- */
+  /* ---- header: hive banner ---- */
   header {
+    position: relative;
     display: flex; align-items: center; gap: 18px;
-    height: 46px; padding: 0 16px;
-    background: linear-gradient(180deg, #17102a, #120c1c);
+    height: 58px; padding: 0 18px;
+    background: linear-gradient(180deg, #1a1130, #0f0a18);
     border-bottom: 1px solid var(--border-bright);
+    overflow: hidden;
   }
+  .banner-art {
+    position: absolute; inset: 0; z-index: 0;
+    width: 100%; height: 100%;
+    object-fit: cover; object-position: center 28%;
+    opacity: .5;
+    filter: saturate(.95) brightness(.85);
+    pointer-events: none; user-select: none;
+  }
+  /* heavy dark overlay so the wordmark stays legible; looks intentional even
+     with no art behind it */
+  header::before {
+    content: '';
+    position: absolute; inset: 0; z-index: 1;
+    background:
+      linear-gradient(90deg, rgba(13,10,18,0.94) 0%, rgba(13,10,18,0.66) 38%, rgba(13,10,18,0.88) 100%),
+      linear-gradient(180deg, rgba(13,10,18,0.30), rgba(13,10,18,0.85));
+    pointer-events: none;
+  }
+  /* bottom seam of the banner */
+  header::after {
+    content: '';
+    position: absolute; left: 0; right: 0; bottom: 0; height: 1px; z-index: 2;
+    background: linear-gradient(90deg, rgba(125,255,94,0.55), rgba(67,49,94,0.8) 35%, rgba(67,49,94,0.8) 70%, rgba(225,63,174,0.5));
+    pointer-events: none;
+  }
+  header > * { position: relative; z-index: 2; }
   .wordmark {
-    font-weight: 800; letter-spacing: 4px; font-size: 15px;
+    position: relative;
+    font-weight: 800; letter-spacing: 5px; font-size: 16px;
     color: var(--green);
-    text-shadow: 0 0 8px rgba(125,255,94,0.45);
+    text-shadow: 0 0 10px rgba(125,255,94,0.5), 0 1px 2px rgba(0,0,0,0.8);
     user-select: none;
+    padding-bottom: 2px;
   }
-  .wordmark em { color: var(--magenta); font-style: normal; text-shadow: 0 0 8px rgba(225,63,174,0.5); }
+  .wordmark em { color: var(--magenta); font-style: normal; text-shadow: 0 0 10px rgba(225,63,174,0.55), 0 1px 2px rgba(0,0,0,0.8); }
+  /* bioluminescent seam under the wordmark, slow ambient pulse */
+  .wordmark::after {
+    content: '';
+    position: absolute; left: 0; right: 4px; bottom: -5px; height: 2px;
+    background: linear-gradient(90deg, var(--green), var(--magenta));
+    animation: seam-breathe 5.2s ease-in-out infinite;
+  }
+  @keyframes seam-breathe { 0%, 100% { opacity: .3; } 50% { opacity: .85; } }
   .vitals { display: flex; align-items: center; gap: 18px; flex: 1; min-width: 0; }
-  .vital { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 11px; white-space: nowrap; }
-  .vital b { color: var(--text); font-weight: 600; }
+  .vital { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 10px; letter-spacing: 1.5px; white-space: nowrap; }
+  .vital b { color: var(--text); font-weight: 600; font-size: 11px; letter-spacing: 0; }
   .turnbar { width: 120px; height: 4px; background: #241a36; border: 1px solid var(--border); }
   .turnbar i {
     display: block; height: 100%; width: 0%;
@@ -80,11 +126,12 @@ export const VIEWER_HTML: string = `<!doctype html>
   @keyframes blink { 50% { opacity: .2; } }
 
   /* ---- layout ---- */
-  main { display: flex; height: calc(100% - 46px); }
+  main { display: flex; height: calc(100% - 58px); }
   #brood {
     width: 340px; min-width: 260px; flex-shrink: 0;
     border-right: 1px solid var(--border);
-    background: var(--panel);
+    background: rgba(22, 16, 32, 0.78);
+    box-shadow: inset -14px 0 28px rgba(0,0,0,0.25);
     overflow-y: auto; padding: 10px;
   }
   #boardcol { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -93,34 +140,60 @@ export const VIEWER_HTML: string = `<!doctype html>
     font-size: 10px; letter-spacing: 3px; color: var(--faint);
     padding: 2px 2px 8px; user-select: none;
   }
+  .bartitle { padding: 0 6px 0 0; }
 
-  /* ---- brood frames ---- */
+  /* ---- brood frames: chitin plates ----
+     outer element paints the bioluminescent seam; ::before is the plate face
+     inset 1px; ::after is the synapse-glow overlay (opacity-only animation). */
   .frame {
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--faint);
-    padding: 7px 9px; margin-bottom: 8px;
-    animation: spawn-in .35s ease-out;
+    --edge: #574b6e;
     position: relative;
-    transition: border-color .3s, opacity .3s;
+    background: linear-gradient(150deg, rgba(125,255,94,0.40), var(--border-bright) 28%, #241a36 62%, rgba(225,63,174,0.30));
+    clip-path: polygon(14px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 10px);
+    padding: 8px 10px 8px 14px;
+    margin-bottom: 9px;
+    animation: spawn-in .4s ease-out;
+    transition: opacity .3s, filter .3s;
   }
+  .frame::before {
+    content: '';
+    position: absolute; inset: 1px; z-index: 0;
+    background: linear-gradient(165deg, var(--panel-2), #171023 70%);
+    clip-path: polygon(13px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%, 0 9px);
+    border-left: 3px solid var(--edge);
+    /* dark plate edge just inside the seam + carapace depth */
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.45), inset 0 12px 26px rgba(0,0,0,0.30);
+    transition: border-color .3s;
+  }
+  .frame::after {
+    content: '';
+    position: absolute; inset: 1px; z-index: 0;
+    clip-path: polygon(13px 0, 100% 0, 100% calc(100% - 11px), calc(100% - 11px) 100%, 0 100%, 0 9px);
+    background: radial-gradient(120% 95% at 45% 50%, rgba(125,255,94,0.14), transparent 72%);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .frame > * { position: relative; z-index: 1; }
+  /* skitter on spawn */
   @keyframes spawn-in {
-    from { opacity: 0; transform: translateX(-14px); }
-    to   { opacity: 1; transform: none; }
+    0%   { opacity: 0; transform: translateX(-16px) rotate(-1.2deg); }
+    55%  { opacity: 1; transform: translateX(3px) rotate(.4deg); }
+    80%  { transform: translateX(-1px) rotate(0deg); }
+    100% { transform: none; }
   }
-  .frame.st-ready { border-left-color: var(--green); }
-  .frame.st-idle  { border-left-color: #b08a2e; opacity: .75; }
-  .frame.st-done  { border-left-color: var(--blue); opacity: .5; filter: saturate(.4); }
-  .frame.thinking { animation: frame-pulse 1.4s ease-in-out infinite; }
-  @keyframes frame-pulse {
-    0%, 100% { box-shadow: 0 0 0 rgba(125,255,94,0); border-color: var(--border); }
-    50%      { box-shadow: 0 0 10px rgba(125,255,94,0.22); border-color: rgba(125,255,94,0.45); }
+  .frame.st-ready { --edge: var(--green); }
+  .frame.st-idle  { --edge: #b08a2e; opacity: .72; }           /* dormant spore */
+  .frame.st-done  { --edge: #6b7a94; opacity: .45; filter: saturate(.2) contrast(.92); }  /* dried husk */
+  /* firing synapse: ready frames glow slow, thinking frames pulse hard */
+  .frame.st-ready::after { animation: synapse 2.8s ease-in-out infinite; }
+  .frame.thinking::after { animation: synapse 1.5s ease-in-out infinite; }
+  .frame.thinking { filter: drop-shadow(0 0 7px rgba(125,255,94,0.28)); }
+  @keyframes synapse { 0%, 100% { opacity: .18; } 50% { opacity: 1; } }
+  .frame.flash::after {
+    background: rgba(225,63,174,0.30);
+    animation: frame-flash .5s ease-out forwards;
   }
-  .frame.flash { animation: frame-flash .5s ease-out; }
-  @keyframes frame-flash {
-    0%   { background: rgba(225,63,174,0.28); }
-    100% { background: var(--panel-2); }
-  }
+  @keyframes frame-flash { from { opacity: 1; } to { opacity: 0; } }
   .fhead { display: flex; align-items: baseline; gap: 7px; }
   .fname { font-weight: 700; color: var(--text); }
   .frole { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
@@ -138,21 +211,29 @@ export const VIEWER_HTML: string = `<!doctype html>
     border: 1px solid rgba(225,63,174,0.5);
     padding: 0 5px; border-radius: 8px; font-size: 10px;
   }
+  .fadapter {
+    color: var(--faint); font-size: 9px; letter-spacing: .5px;
+    border: 1px solid var(--border); padding: 0 4px;
+    max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .ptag { color: var(--faint); }
   .empty { color: var(--faint); text-align: center; padding: 28px 8px; font-size: 12px; }
 
   /* ---- board ---- */
+  /* pinned strip: membrane sac */
   #pinstrip {
     display: none; padding: 7px 12px;
-    background: rgba(125,255,94,0.05);
-    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(225,63,174,0.10), rgba(225,63,174,0.05));
+    border-bottom: 1px solid rgba(225,63,174,0.35);
+    box-shadow: inset 0 -10px 20px rgba(225,63,174,0.05);
     flex-wrap: wrap; gap: 6px;
   }
   #pinstrip.haspins { display: flex; }
   .pinchip {
-    border: 1px solid rgba(125,255,94,0.4); color: var(--green);
-    background: rgba(125,255,94,0.07);
-    padding: 2px 8px; font-size: 11px;
+    border: 1px solid rgba(225,63,174,0.45); color: #f0a8d6;
+    background: rgba(225,63,174,0.10);
+    border-radius: 10px;
+    padding: 2px 9px; font-size: 11px;
     max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .pinchip .by { color: var(--dim); }
@@ -160,13 +241,13 @@ export const VIEWER_HTML: string = `<!doctype html>
   #boardbar {
     display: flex; align-items: center; gap: 8px;
     padding: 8px 12px; border-bottom: 1px solid var(--border);
-    background: var(--panel); flex-wrap: wrap;
+    background: rgba(22, 16, 32, 0.78); flex-wrap: wrap;
   }
   .tab {
     background: none; border: 1px solid var(--border); color: var(--dim);
     font: inherit; font-size: 11px; padding: 3px 9px; cursor: pointer;
   }
-  .tab:hover { border-color: var(--border-bright); color: var(--text); }
+  .tab:hover { border-color: var(--green-dim); color: var(--text); }
   .tab.active { border-color: var(--magenta); color: var(--magenta); background: rgba(225,63,174,0.08); }
   .tab .cnt { color: var(--faint); margin-left: 4px; }
   #filter {
@@ -182,16 +263,22 @@ export const VIEWER_HTML: string = `<!doctype html>
   #followbtn.on { color: var(--green); border-color: var(--green-dim); }
 
   #feed { flex: 1; overflow-y: auto; padding: 6px 0 24px; }
+  /* event rows: thin vein down the left edge, glows briefly as the row lands */
   .evt {
     display: grid;
     grid-template-columns: 52px 110px 110px 130px 1fr;
-    gap: 8px; padding: 4px 12px;
+    gap: 8px; padding: 4px 12px 4px 10px;
     border-bottom: 1px solid #171024;
+    border-left: 2px solid rgba(125,255,94,0.10);
     align-items: baseline;
-    animation: row-in .25s ease-out;
+    animation: row-in .6s ease-out;
   }
-  @keyframes row-in { from { opacity: 0; } to { opacity: 1; } }
-  .evt:hover { background: rgba(255,255,255,0.02); }
+  @keyframes row-in {
+    0%   { opacity: 0; border-left-color: rgba(125,255,94,0.9); }
+    30%  { opacity: 1; border-left-color: rgba(125,255,94,0.6); }
+    100% { border-left-color: rgba(125,255,94,0.10); }
+  }
+  .evt:hover { background: rgba(255,255,255,0.02); border-left-color: rgba(125,255,94,0.35); }
   .eid { color: var(--faint); font-size: 11px; text-align: right; }
   .badge {
     font-size: 10px; letter-spacing: .5px; text-align: center;
@@ -224,23 +311,25 @@ export const VIEWER_HTML: string = `<!doctype html>
 </head>
 <body>
 <header>
+  <img class="banner-art" src="/assets/swarmlord.png" alt="" onerror="this.style.display='none'">
   <div class="wordmark">SWARM<em>LORD</em></div>
   <div class="vitals">
-    <div class="vital"><span>turns</span><div class="turnbar" id="turnbar"><i></i></div><b id="turnnum">0/0</b></div>
-    <div class="vital"><span>brood</span><b id="agentnum">0/0</b></div>
-    <div class="vital"><span>events</span><b id="eventnum">0</b></div>
+    <div class="vital"><span>BIOMASS</span><div class="turnbar" id="turnbar"><i></i></div><b id="turnnum">0/0</b></div>
+    <div class="vital"><span>BROOD</span><b id="agentnum">0/0</b></div>
+    <div class="vital"><span>SPOOR</span><b id="eventnum">0</b></div>
   </div>
   <div class="conn"><span id="connlabel">connecting</span><span class="dot" id="conndot"></span></div>
 </header>
 <main>
   <section id="brood">
-    <div class="coltitle">BROOD</div>
+    <div class="coltitle">THE BROOD</div>
     <div id="frames"></div>
     <div class="empty" id="broodEmpty">the hive is quiet</div>
   </section>
   <section id="boardcol">
     <div id="pinstrip"></div>
     <div id="boardbar">
+      <span class="coltitle bartitle">HIVE CHATTER</span>
       <span id="tabs"></span>
       <button id="followbtn" class="on" title="auto-scroll to newest">FOLLOWING</button>
       <input id="filter" type="text" placeholder="filter…" spellcheck="false">
@@ -307,6 +396,11 @@ export const VIEWER_HTML: string = `<!doctype html>
     var turns = document.createElement('span');
     var wakes = document.createElement('span'); wakes.className = 'wakes'; wakes.style.display = 'none';
     meta.appendChild(turns); meta.appendChild(wakes);
+    if (a.adapter) {
+      var ad = document.createElement('span'); ad.className = 'fadapter';
+      ad.textContent = a.adapter; ad.title = a.adapter;
+      meta.appendChild(ad);
+    }
     if (a.parent) {
       var pt = document.createElement('span'); pt.className = 'ptag';
       pt.textContent = '\\u2190 ' + a.parent;

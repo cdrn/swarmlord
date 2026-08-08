@@ -17,6 +17,12 @@ export interface AgentSpec {
   role: string
   prompt: string
   subscriptions?: SubscriptionFilter[]
+  /**
+   * Per-agent adapter override — e.g. a cheaper model for scouts while the
+   * overseer runs the big one. Only settable from code (specs passed to
+   * spawn()/run()); the spawn verb can't reach it.
+   */
+  adapter?: ModelAdapter
 }
 
 export interface SwarmOptions {
@@ -26,6 +32,20 @@ export interface SwarmOptions {
   maxTotalTurns?: number
   pinSlots?: number
   claimTtlMs?: number
+  /**
+   * Defaults for the root agent spawned by run() — set the overseer prompt,
+   * name, role, subscriptions, or adapter here. run()'s own root argument
+   * overrides these field by field.
+   */
+  root?: Partial<AgentSpec>
+  /**
+   * Replace the built-in protocol preamble (the shared system-prompt rules
+   * every agent gets). Start from the exported PROTOCOL_PREAMBLE to tweak
+   * rather than rewrite.
+   */
+  protocolPreamble?: string
+  /** Appended after the (built-in or replaced) preamble — house rules. */
+  protocolAppendix?: string
   onEvent?: (evt: SwarmEvent) => void
   onTurn?: (info: { agent: string; turn: number; text: string; toolCalls: ToolCall[] }) => void
 }
@@ -50,6 +70,8 @@ export interface AgentSnapshot {
   lastActivity: string
   lastActivityAt: number
   summary: string | null
+  /** Name of the adapter this agent runs on (per-agent override or swarm default). */
+  adapter: string
 }
 
 export interface SwarmSnapshot {
@@ -73,7 +95,7 @@ interface AgentState {
   wakes: SwarmEvent[]
 }
 
-const PROTOCOL_PREAMBLE = `You are one agent in a swarm coordinating through a shared event log and blackboard. Everything anyone does is an event with an id; channels, claims, and pins are views over that log. Follow this protocol:
+export const PROTOCOL_PREAMBLE = `You are one agent in a swarm coordinating through a shared event log and blackboard. Everything anyone does is an event with an id; channels, claims, and pins are views over that log. Follow this protocol:
 
 1. Orient before you act. Use list_channels and query to see what already exists. The channel or finding you need probably already exists — read it before creating or re-deriving it.
 2. Cite, don't copy. Event ids are citations. When you build on prior work, pass those ids in refs instead of restating the content.
@@ -85,7 +107,7 @@ const PROTOCOL_PREAMBLE = `You are one agent in a swarm coordinating through a s
 8. Subscribe to what you must react to, then idle when you're waiting on others. You wake only on subscribed events — subscribe before you idle.
 9. Call complete with a summary (citing event ids) when your work is truly finished. Idle means waiting; complete means done for good.`
 
-const DEFAULT_ROOT_PROMPT = `You are the coordinator of this swarm. Break the task into independent workstreams and spawn a focused agent for each rather than doing everything yourself. Set up channels for the work (checking the catalog first), tell each spawned agent where to post, and subscribe to their channels and to agent_done events so their results wake you. While workers run, idle; when woken, read what arrived, integrate, redirect or spawn as needed. When the task is fulfilled, post a final synthesis citing the key event ids, then call complete with a summary.`
+export const DEFAULT_ROOT_PROMPT = `You are the coordinator of this swarm. Break the task into independent workstreams and spawn a focused agent for each rather than doing everything yourself. Set up channels for the work (checking the catalog first), tell each spawned agent where to post, and subscribe to their channels and to agent_done events so their results wake you. While workers run, idle; when woken, read what arrived, integrate, redirect or spawn as needed. When the task is fulfilled, post a final synthesis citing the key event ids, then call complete with a summary.`
 
 const DEFAULT_MAX_AGENTS = 32
 const DEFAULT_MAX_TOTAL_TURNS = 200
@@ -113,6 +135,8 @@ export class Swarm {
   private readonly adapter: ModelAdapter
   private readonly maxAgents: number
   private readonly maxTotalTurns: number
+  private readonly protocol: string
+  private readonly rootDefaults: Partial<AgentSpec>
   private readonly onEvent?: (evt: SwarmEvent) => void
   private readonly onTurn?: SwarmOptions['onTurn']
 
@@ -125,6 +149,10 @@ export class Swarm {
     this.adapter = opts.adapter
     this.maxAgents = opts.maxAgents ?? DEFAULT_MAX_AGENTS
     this.maxTotalTurns = opts.maxTotalTurns ?? DEFAULT_MAX_TOTAL_TURNS
+    this.protocol =
+      (opts.protocolPreamble ?? PROTOCOL_PREAMBLE) +
+      (opts.protocolAppendix ? `\n\n${opts.protocolAppendix}` : '')
+    this.rootDefaults = opts.root ?? {}
     this.onEvent = opts.onEvent
     this.onTurn = opts.onTurn
     this.log = new EventLog(opts.dbPath)
@@ -150,6 +178,7 @@ export class Swarm {
         lastActivity: s.lastActivity,
         lastActivityAt: s.lastActivityAt,
         summary: s.summary,
+        adapter: (s.spec.adapter ?? this.adapter).name,
       })),
       turnsTaken: this.turnsTaken,
       maxTotalTurns: this.maxTotalTurns,
@@ -209,10 +238,11 @@ export class Swarm {
 
   async run(task: string, root?: Partial<AgentSpec>): Promise<SwarmResult> {
     const rootSpec: AgentSpec = {
-      name: root?.name ?? 'overseer',
-      role: root?.role ?? 'coordinator',
-      prompt: root?.prompt ?? DEFAULT_ROOT_PROMPT,
-      subscriptions: root?.subscriptions,
+      name: root?.name ?? this.rootDefaults.name ?? 'overseer',
+      role: root?.role ?? this.rootDefaults.role ?? 'coordinator',
+      prompt: root?.prompt ?? this.rootDefaults.prompt ?? DEFAULT_ROOT_PROMPT,
+      subscriptions: root?.subscriptions ?? this.rootDefaults.subscriptions,
+      adapter: root?.adapter ?? this.rootDefaults.adapter,
     }
     const spawned = this.spawnInternal(null, rootSpec, task)
     if (!spawned.ok) throw new Error(`failed to spawn root agent: ${spawned.error}`)
@@ -256,7 +286,7 @@ export class Swarm {
     this.setActivity(state, 'thinking…')
     let result: TurnResult
     try {
-      result = await this.adapter.turn({
+      result = await (state.spec.adapter ?? this.adapter).turn({
         system: this.buildSystemPrompt(state.spec),
         messages: state.messages,
         tools: toolDefs,
@@ -363,8 +393,12 @@ export class Swarm {
       state.messages.push({
         role: 'user',
         content:
-          '(You made no tool calls, so you were idled. You will wake when an event ' +
-          'matching your subscriptions arrives. Prefer calling idle or complete explicitly.)',
+          state.subscriptions.length > 0
+            ? '(You made no tool calls, so you were idled. You will wake when an event ' +
+              'matching your subscriptions arrives. Prefer calling idle or complete explicitly.)'
+            : '(You made no tool calls, so you were idled — and you have NO subscriptions, ' +
+              'so only a pin can wake you. If you are waiting on something, wake and ' +
+              'subscribe to it; if you are finished, call complete.)',
       })
     } else {
       this.setActivity(state, describeToolCalls(result.toolCalls))
@@ -378,6 +412,7 @@ export class Swarm {
           this.agents.get(agentName)?.subscriptions.push(filter)
         },
         agentNames: () => [...this.agents.keys()],
+        subscriptionsOf: agentName => this.agents.get(agentName)?.subscriptions ?? [],
       }
       const results: Array<{ toolCallId: string; content: string; isError?: boolean }> = []
       for (const call of result.toolCalls) {
@@ -463,7 +498,7 @@ export class Swarm {
 
   private buildSystemPrompt(spec: AgentSpec): string {
     let prompt =
-      PROTOCOL_PREAMBLE +
+      this.protocol +
       `\n\nYour name is "${spec.name}". Your role: ${spec.role}.\n\n` +
       spec.prompt
     const pins = this.board.pins()

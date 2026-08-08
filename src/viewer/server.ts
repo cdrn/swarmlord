@@ -5,9 +5,24 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { readFileSync } from 'node:fs'
 import type { Socket } from 'node:net'
 import type { Swarm } from '../core/runtime.js'
 import { VIEWER_HTML } from './ui.js'
+
+// Package root relative to this module — same depth from src/ and dist/.
+const HERO_ART_URL = new URL('../../assets/swarmlord.png', import.meta.url)
+let heroArt: Buffer | null | undefined
+function loadHeroArt(): Buffer | null {
+  if (heroArt === undefined) {
+    try {
+      heroArt = readFileSync(HERO_ART_URL)
+    } catch {
+      heroArt = null
+    }
+  }
+  return heroArt
+}
 
 export interface ViewerOptions {
   /** Default 7717. Use 0 to bind an ephemeral port (reported in the handle). */
@@ -73,6 +88,17 @@ export function startViewer(swarm: Swarm, opts: ViewerOptions = {}): Promise<Vie
       case '/': {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         res.end(VIEWER_HTML)
+        return
+      }
+
+      case '/assets/swarmlord.png': {
+        const art = loadHeroArt()
+        if (art === null) {
+          sendJson(res, { error: 'not found' }, 404)
+          return
+        }
+        res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'max-age=3600' })
+        res.end(art)
         return
       }
 
