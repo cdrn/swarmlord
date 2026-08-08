@@ -535,6 +535,92 @@ describe('Swarm runtime', () => {
     expect(opEvents.some(e => e.body.includes('operator → overseer'))).toBe(true)
   })
 
+  it('delivers direct mail (send) to a peer, always waking the recipient', async () => {
+    let sawMail = false
+    const adapter = new MockAdapter(req => {
+      const who = /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+      if (who === 'overseer') {
+        if (/Your name is "overseer"/.test(req.system) && !req.messages.some(m => m.role === 'tool_results')) {
+          // Spawn a worker that will just idle waiting, then mail it directly.
+          return turnOf([
+            { name: 'spawn', input: { name: 'worker', role: 'w', prompt: 'wait for orders' } },
+            { name: 'send', input: { to: 'worker', body: 'run the alpha sweep now' } },
+            { name: 'subscribe', input: { types: ['agent_done'] } },
+            { name: 'idle', input: { reason: 'sent orders' } },
+          ])
+        }
+        return turnOf([{ name: 'complete', input: { summary: 'overseer done' } }])
+      }
+      // worker: never subscribed to anyone, but direct mail must still reach it
+      const mail = req.messages.find(
+        m => m.role === 'user' && m.content.includes('Direct message from overseer'),
+      )
+      if (mail && mail.role === 'user' && mail.content.includes('alpha sweep')) {
+        sawMail = true
+        return turnOf([{ name: 'complete', input: { summary: 'ran the sweep' } }])
+      }
+      // First turn (spawn message): no subscriptions, so idle guard would fire;
+      // subscribe to nothing meaningful then idle so only mail can wake it.
+      return turnOf([
+        { name: 'subscribe', input: { channels: ['void'] } },
+        { name: 'idle', input: { reason: 'awaiting orders' } },
+      ])
+    })
+
+    const swarm = new Swarm({ adapter, maxTotalTurns: 15, heartbeatEveryTurns: 0 })
+    const result = await swarm.run('mail test')
+
+    expect(sawMail).toBe(true)
+    expect(result.finalSummaries.worker).toBe('ran the sweep')
+    const mailEvents = swarm.log.query({ types: ['message'] })
+    expect(mailEvents.some(e => e.agent === 'overseer' && (e.meta as { to?: string }).to === 'worker')).toBe(true)
+  })
+
+  it('heartbeats the idle supervisor to actively survey while workers are in flight', async () => {
+    let heartbeats = 0
+    let sawRoster = false
+    let grinderTurns = 0
+    const adapter = new MockAdapter(req => {
+      const who = /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+      if (who === 'overseer') {
+        const isHeartbeat = req.messages.some(
+          m => m.role === 'user' && m.content.includes('oversight pass'),
+        )
+        if (isHeartbeat) {
+          heartbeats++
+          if (req.messages.some(m => m.role === 'user' && m.content.includes('Workers:'))) {
+            sawRoster = true
+          }
+          if (heartbeats >= 2) return turnOf([{ name: 'complete', input: { summary: 'supervised' } }])
+          return turnOf([{ name: 'idle', input: { reason: 'still watching' } }])
+        }
+        // First turn: spawn a busy worker, subscribe elsewhere, idle.
+        return turnOf([
+          { name: 'spawn', input: { name: 'grinder', role: 'w', prompt: 'grind' } },
+          { name: 'subscribe', input: { channels: ['results'] } },
+          { name: 'idle', input: { reason: 'workers running' } },
+        ])
+      }
+      // grinder: stay busy (keep making tool calls, never idle) so it takes a
+      // turn every loop and drives turnsTaken up past the heartbeat interval.
+      grinderTurns++
+      if (grinderTurns === 1) {
+        return turnOf([{ name: 'create_channel', input: { name: 'work', purpose: 'grinding', tags: [] } }])
+      }
+      if (grinderTurns < 12) {
+        return turnOf([{ name: 'post', input: { channel: 'work', body: `chunk ${grinderTurns}` } }])
+      }
+      return turnOf([{ name: 'idle', input: { reason: 'done grinding' } }])
+    })
+
+    const swarm = new Swarm({ adapter, maxTotalTurns: 60, heartbeatEveryTurns: 3 })
+    const result = await swarm.run('supervise actively')
+
+    expect(heartbeats).toBeGreaterThanOrEqual(2)
+    expect(sawRoster).toBe(true)
+    expect(result.finalSummaries.overseer).toBe('supervised')
+  })
+
   it('auto-retires a model on a provisioning error and notifies the parent to reroute', async () => {
     // A "broken" model that always 403s, plus a working default.
     const broken = namedMock('openai:gpt-x', () => {

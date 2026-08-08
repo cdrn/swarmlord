@@ -9,7 +9,7 @@ import type { SubscriptionFilter } from './subscriptions.js'
 import type { ToolCall, ToolDef } from '../adapters/types.js'
 import type { EventLog } from './log.js'
 import type { Blackboard } from './board.js'
-import type { AgentSpec, ModelCatalogEntry } from './runtime.js'
+import type { AgentSpec, AgentSnapshot, ModelCatalogEntry } from './runtime.js'
 import { generateAgentName } from './names.js'
 
 export interface VerbContext {
@@ -27,6 +27,10 @@ export interface VerbContext {
   retireModel(name: string, by?: string, reason?: string): { ok: boolean; error?: string }
   /** Undo a retire, making the model spawnable again. */
   restoreModel(name: string, by?: string): { ok: boolean; error?: string }
+  /** Live roster of every agent and its status — for the roster verb. */
+  roster(): AgentSnapshot[]
+  /** Direct mail: deliver a message to a named agent, always waking them. */
+  deliverTo(from: string, to: string, body: string, refs?: number[]): { ok: boolean; error?: string }
 }
 
 export interface VerbResult {
@@ -68,6 +72,40 @@ const subscriptionProps = {
 } as const
 
 export const toolDefs: ToolDef[] = [
+  {
+    name: 'send',
+    description:
+      'Send a direct message to another agent by name. Unlike a channel post, ' +
+      'this always reaches the recipient and wakes them, even if they never ' +
+      'subscribed to you — it is their inbox. Use it to hand off work, ask a ' +
+      'peer a question, answer one, or chase a worker who has gone quiet. For ' +
+      'the shared record or for anyone watching, post to a channel instead; for ' +
+      'a specific agent, send. Cite relevant event ids in refs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Recipient agent name (see roster / list_channels).' },
+        body: { type: 'string', description: 'The message.' },
+        refs: {
+          type: 'array',
+          items: { type: 'integer' },
+          description: 'Event ids this message refers to.',
+        },
+      },
+      required: ['to', 'body'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'roster',
+    description:
+      'List every agent in the swarm right now with its role, status ' +
+      '(ready/idle/done), model, turn count, and current activity. Use it to ' +
+      'survey who exists and how things are chugging along — who is working, ' +
+      'who is stalled or idle, who finished, who failed — before you send, ' +
+      'spawn, or decide the task is done.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
   {
     name: 'list_models',
     description:
@@ -384,6 +422,19 @@ export function executeVerb(ctx: VerbContext, agentName: string, call: ToolCall)
   const input = call.input ?? {}
   try {
     switch (call.name) {
+      case 'send': {
+        const to = reqString(input, 'to')
+        const body = reqString(input, 'body')
+        const refs = Array.isArray(input.refs) ? (input.refs as number[]) : undefined
+        const result = ctx.deliverTo(agentName, to, body, refs)
+        if (!result.ok) return err({ sent: false, error: result.error })
+        return ok({ sent: true, to })
+      }
+
+      case 'roster': {
+        return ok({ agents: ctx.roster() })
+      }
+
       case 'list_models': {
         return ok({ models: ctx.catalog() })
       }

@@ -83,6 +83,12 @@ export interface SwarmOptions {
   /** Milliseconds to wait before each turn — throttle a swarm to watch it. */
   turnDelayMs?: number
   /**
+   * Wake the idle root/coordinator every N swarm turns to actively survey its
+   * workers (chase stalls, reroute failures, verify progress) instead of only
+   * waking on subscribed events. 0 disables. Default 6.
+   */
+  heartbeatEveryTurns?: number
+  /**
    * When true, hitting maxTotalTurns pauses the run at the cap instead of
    * ending it, so raising the cap (slider/configure) resumes the same run.
    * The run then ends only on genuine quiescence or an explicit stop().
@@ -147,6 +153,7 @@ export interface SwarmConfigView {
   protocolAppendix: string
   paused: boolean
   turnDelayMs: number
+  heartbeatEveryTurns: number
   holdAtCap: boolean
   running: boolean
   hiveNames: boolean
@@ -172,6 +179,8 @@ export interface SwarmConfigUpdate {
   /** Freeze/resume turn-taking. A paused swarm never terminates. */
   paused?: boolean
   turnDelayMs?: number
+  /** Retune the supervisor heartbeat cadence (0 = off). */
+  heartbeatEveryTurns?: number
   /** Replaces the appendix; applies to every subsequent turn's system prompt. */
   protocolAppendix?: string
   /** Toggle forced hive names for agent-initiated spawns. */
@@ -221,22 +230,27 @@ export const PROTOCOL_PREAMBLE = `You are one agent in a swarm coordinating thro
 6. Pin only what everyone must see. Pin slots are scarce on purpose.
 7. Spawn agents for parallelizable work. Give each a clear name, role, and prompt saying what to do, where to post, and to call complete when finished. Spawns are public events.
 8. Match the model to the work when you spawn. call list_models to see what's available — each model lists strengths, cautions, and cost. Pass model:<name> for a specific one, or tier (heavy/standard/light) for a coarse pick; omit both to accept the default. Read the cautions: some models have strict guardrails or weak spots, so don't hand a model a task its manifest warns against. Cheap models for scanning and bulk, capable models for synthesis and judgment.
-9. Subscribe to what you must react to, then idle when you're waiting on others. You wake only on subscribed events — subscribe before you idle.
-10. Call complete with a summary (citing event ids) when your work is truly finished. Idle means waiting; complete means done for good.`
+9. Talk to each other directly. Use send to deliver a message straight to another agent by name — it always reaches them and wakes them, even if they didn't subscribe to you. Use it to hand off work, ask a peer a question, answer one, or chase a worker who's gone quiet. Direct mail (send) is for a specific agent; posting to a channel is for the record and for anyone watching. Check roster to see who exists and what they're doing before you send.
+10. Subscribe to what you must react to, then idle when you're waiting on others. You wake only on subscribed events (and on direct mail) — subscribe before you idle.
+11. Call complete with a summary (citing event ids) when your work is truly finished. Idle means waiting; complete means done for good.`
 
 export const DEFAULT_ROOT_PROMPT = `You are the coordinator of this swarm. Break the task into independent workstreams and spawn a focused agent for each rather than doing everything yourself. Consult list_models and choose a fitting model per worker — capable models for synthesis and judgment, cheap ones for scanning and bulk, and steer clear of a model whose cautions warn against the task. Set up channels for the work (checking the catalog first), tell each spawned agent where to post, and subscribe to their channels and to agent_done events so their results wake you.
 
 Watch for models that are a bad fit: if a worker's model refuses its task (a refusal event) or flounders, that's a signal the pick was wrong — respawn the task on a model whose manifest fits, and if a model is consistently wrong for this swarm's work, retire_model it so nothing else spawns on it. Don't reflexively retry a refusal on another model just to get past it: judge whether it was a capability gap (reroute) or a correct refusal (respect it).
 
-While workers run, idle; when woken, read what arrived, integrate, redirect or spawn as needed. When the task is fulfilled, post a final synthesis citing the key event ids, then call complete with a summary.`
+Oversee actively — do not just dispatch and sleep. You are nudged periodically with a heartbeat and a roster of your workers; use it. Each pass, check every worker: making progress, stalled, idle waiting on something, or failed? Chase silent or stuck workers with a direct send, respawn any that died (rerouting off retired models), and add or redirect workers where the plan needs it. You can also call roster any time to survey live status yourself. Idle between passes, but stay on top of the whole operation. When the task is genuinely fulfilled, post a final synthesis citing the key event ids, then call complete with a summary.`
 
 const DEFAULT_MAX_AGENTS = 32
 const DEFAULT_MAX_TOTAL_TURNS = 200
+/** Wake the idle supervisor to survey the brood every N swarm turns (0 = off). */
+const DEFAULT_HEARTBEAT_TURNS = 6
 
 /**
  * Bookkeeping event types wake an agent only when its filter EXPLICITLY lists
  * the type in `types` — never via catch-all/tag/text matches. Otherwise two
  * broadly-subscribed agents livelock waking each other with agent_idle events.
+ * `message` is direct mail: the recipient is woken by delivery, not by the
+ * subscription fan-out, so it's here to keep others' mail out of broad wakes.
  */
 const BOOKKEEPING_TYPES: ReadonlySet<EventType> = new Set<EventType>([
   'agent_idle',
@@ -244,6 +258,7 @@ const BOOKKEEPING_TYPES: ReadonlySet<EventType> = new Set<EventType>([
   'claimed',
   'claim_released',
   'spawned',
+  'message',
 ])
 
 /** Pins are the salience mechanism: pin/unpin events cut through subscriptions. */
@@ -264,6 +279,12 @@ export class Swarm {
   private stopped = false
   private holdAtCap: boolean
   private hiveNames: boolean
+  private heartbeatEveryTurns: number
+  private lastHeartbeatTurn = 0
+  /** One oversight pass per stall: set when nudged into a quiescent swarm, reset on worker progress. */
+  private quiescentOversightDone = false
+  /** The root/coordinator: heartbeat-woken to actively supervise. */
+  private supervisorName: string | null = null
   private readonly rootDefaults: Partial<AgentSpec>
   private tiers: Partial<Record<TierName, ModelAdapter>>
   private tierWeights: Partial<Record<TierName, number>>
@@ -288,6 +309,7 @@ export class Swarm {
     this.turnDelayMs = opts.turnDelayMs ?? 0
     this.holdAtCap = opts.holdAtCap ?? false
     this.hiveNames = opts.hiveNames ?? false
+    this.heartbeatEveryTurns = opts.heartbeatEveryTurns ?? DEFAULT_HEARTBEAT_TURNS
     this.rootDefaults = opts.root ?? {}
     this.tiers = { ...opts.tiers }
     this.tierWeights = opts.tierWeights ?? {}
@@ -327,6 +349,7 @@ export class Swarm {
       protocolAppendix: this.protocolAppendix,
       paused: this.paused,
       turnDelayMs: this.turnDelayMs,
+      heartbeatEveryTurns: this.heartbeatEveryTurns,
       holdAtCap: this.holdAtCap,
       running: this.running,
       hiveNames: this.hiveNames,
@@ -416,6 +439,12 @@ export class Swarm {
       }
       this.turnDelayMs = update.turnDelayMs
     }
+    if (update.heartbeatEveryTurns !== undefined) {
+      if (!Number.isInteger(update.heartbeatEveryTurns) || update.heartbeatEveryTurns < 0) {
+        throw new Error(`heartbeatEveryTurns must be a non-negative integer, got ${update.heartbeatEveryTurns}`)
+      }
+      this.heartbeatEveryTurns = update.heartbeatEveryTurns
+    }
     if (update.protocolAppendix !== undefined) this.protocolAppendix = update.protocolAppendix
     if (update.hiveNames !== undefined) this.hiveNames = update.hiveNames
     if (update.holdAtCap !== undefined) this.holdAtCap = update.holdAtCap
@@ -473,6 +502,126 @@ export class Swarm {
       content: `(Supervision notice about a worker you spawned.)\n${text}`,
     })
     if (parent.status === 'idle') parent.status = 'ready'
+  }
+
+  /**
+   * Direct agent-to-agent mail (the `send` verb / mailbox view). The recipient
+   * always receives it — no subscription needed — which is what makes it an
+   * inbox rather than a broadcast. Logged as a `message` event carrying the
+   * addressee, so the mailbox is just "log filtered by meta.to".
+   */
+  deliverTo(
+    from: string,
+    to: string,
+    body: string,
+    refs: number[] = [],
+  ): { ok: boolean; error?: string } {
+    const recipient = this.agents.get(to)
+    if (recipient === undefined) {
+      return { ok: false, error: `no agent named "${to}" — agents: ${[...this.agents.keys()].join(', ')}` }
+    }
+    if (recipient.status === 'done') {
+      return { ok: false, error: `agent "${to}" has completed and cannot receive mail` }
+    }
+    const evt = this.log.append({
+      type: 'message',
+      agent: from,
+      channel: null,
+      body,
+      tags: ['message'],
+      refs,
+      meta: { to },
+    })
+    recipient.messages.push({
+      role: 'user',
+      content: `(Direct message from ${from} — event #${evt.id}. Reply with send if it needs an answer.)\n${body}`,
+    })
+    if (recipient.status === 'idle') recipient.status = 'ready'
+    this.deliverNewEvents(from)
+    return { ok: true }
+  }
+
+  /** Live roster of every agent — what the supervisor surveys. */
+  roster(): AgentSnapshot[] {
+    return this.snapshot().agents
+  }
+
+  private supervisorState(): AgentState | undefined {
+    return this.supervisorName === null ? undefined : this.agents.get(this.supervisorName)
+  }
+
+  private liveWorkers(): AgentState[] {
+    return [...this.agents.values()].filter(
+      s => s.spec.name !== this.supervisorName && s.status !== 'done',
+    )
+  }
+
+  private nudgeSupervisor(sup: AgentState, kind: 'heartbeat' | 'stall'): void {
+    const lead =
+      kind === 'stall'
+        ? '(Oversight — the swarm has gone quiet but workers are still alive. Survey and act; do not let it stall.)'
+        : '(Heartbeat — do an active oversight pass. Do not just wait.)'
+    sup.messages.push({
+      role: 'user',
+      content:
+        `${lead}\n` +
+        this.rosterText() +
+        '\nCheck each worker: making progress, stalled, idle waiting on something, or failed? ' +
+        'Chase stalled or silent workers with a direct send, respawn any that died (reroute off ' +
+        'retired models), redirect or add workers as needed. When the whole task is genuinely ' +
+        'done, post the synthesis and call complete. If everything is healthy and simply in ' +
+        'progress, idle again.',
+    })
+    sup.status = 'ready'
+    this.lastHeartbeatTurn = this.turnsTaken
+  }
+
+  /**
+   * Periodic oversight: nudge the idle supervisor while workers are actively
+   * taking turns, so it surveys mid-flight instead of only waking on events.
+   * Gated on a busy (ready) worker so it never spins in the quiescent tail —
+   * that case is handled once by wakeSupervisorForStall().
+   */
+  private maybeHeartbeat(): void {
+    if (this.heartbeatEveryTurns <= 0) return
+    if (this.turnsTaken - this.lastHeartbeatTurn < this.heartbeatEveryTurns) return
+    const sup = this.supervisorState()
+    if (sup === undefined || sup.status !== 'idle' || sup.wakes.length > 0) return
+    const busy = [...this.agents.values()].some(
+      s => s.spec.name !== this.supervisorName && s.status === 'ready',
+    )
+    if (!busy) return
+    this.nudgeSupervisor(sup, 'heartbeat')
+  }
+
+  /**
+   * Anti-stall: when the swarm would otherwise terminate but workers are still
+   * alive and the supervisor is idle, wake it for a single oversight pass.
+   * The one-shot guard (reset on any worker progress) prevents infinite spin —
+   * if the supervisor does nothing, the run ends on the next quiescent check.
+   * Returns whether it woke the supervisor.
+   */
+  private wakeSupervisorForStall(): boolean {
+    if (this.quiescentOversightDone) return false
+    const sup = this.supervisorState()
+    if (sup === undefined || sup.status !== 'idle' || sup.wakes.length > 0) return false
+    if (this.liveWorkers().length === 0) return false
+    this.quiescentOversightDone = true
+    this.nudgeSupervisor(sup, 'stall')
+    return true
+  }
+
+  /** Compact worker roster for the heartbeat nudge. */
+  private rosterText(): string {
+    const lines = [...this.agents.values()]
+      .filter(s => s.spec.name !== this.supervisorName)
+      .map(s => {
+        const act = s.lastActivity.replace(/\s+/g, ' ').trim()
+        const excerpt = act.length > 80 ? act.slice(0, 80) + '…' : act
+        const model = s.tier ? `${s.tier}/${s.adapter.name}` : s.adapter.name
+        return `  - ${s.spec.name} [${s.status}] (${s.spec.role}, ${model}, ${s.turns} turns): ${excerpt}`
+      })
+    return lines.length > 0 ? `Workers:\n${lines.join('\n')}` : 'No workers spawned yet.'
   }
 
   private protocol(): string {
@@ -737,6 +886,9 @@ export class Swarm {
     }
     const spawned = this.spawnInternal(null, rootSpec, task, 'code')
     if (!spawned.ok) throw new Error(`failed to spawn root agent: ${spawned.error}`)
+    this.supervisorName = rootSpec.name
+    this.lastHeartbeatTurn = 0
+    this.quiescentOversightDone = false
     this.deliverNewEvents(null)
 
     const finalSummaries: Record<string, string> = {}
@@ -760,12 +912,26 @@ export class Swarm {
           continue
         }
 
+        // Active oversight (periodic): nudge the idle supervisor while workers
+        // are busy, so it surveys instead of sleeping through the whole run.
+        this.maybeHeartbeat()
+
         // Idle agents with queued wakes become ready again.
         for (const state of this.agents.values()) {
           if (state.status === 'idle' && state.wakes.length > 0) state.status = 'ready'
         }
         const ready = [...this.agents.values()].filter(s => s.status === 'ready')
-        if (ready.length === 0) break
+        // A ready worker means real progress — clear the one-shot stall guard.
+        if (ready.some(s => s.spec.name !== this.supervisorName)) this.quiescentOversightDone = false
+
+        if (ready.length === 0) {
+          // The swarm would terminate. But if workers are still alive (idle,
+          // maybe stalled) and the supervisor is asleep, give it ONE oversight
+          // pass to chase them or wrap up — rather than quietly ending with
+          // work unfinished. The guard stops this from spinning.
+          if (this.wakeSupervisorForStall()) continue
+          break
+        }
 
         for (const state of ready) {
           while (this.paused && !this.stopped) await sleep(150)
@@ -964,6 +1130,8 @@ export class Swarm {
         catalog: () => this.catalog(),
         retireModel: (n, by, reason) => this.retireModel(n, by, reason),
         restoreModel: (n, by) => this.restoreModel(n, by),
+        roster: () => this.roster(),
+        deliverTo: (from, to, body, refs) => this.deliverTo(from, to, body, refs),
       }
       const results: Array<{ toolCallId: string; content: string; isError?: boolean }> = []
       for (const call of result.toolCalls) {
@@ -982,6 +1150,12 @@ export class Swarm {
           summary = verbResult.summary ?? ''
           state.summary = summary
           this.setActivity(state, 'complete')
+          // Wake the parent so it notices a worker finished and can integrate
+          // or wind down, without relying on an agent_done subscription.
+          this.notifyParent(
+            state,
+            `Your worker "${name}" completed: ${summary || '(no summary)'}. Integrate its results or reassign if more is needed.`,
+          )
         }
       }
       state.messages.push({ role: 'tool_results', results })

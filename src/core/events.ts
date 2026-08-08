@@ -16,6 +16,7 @@ export type EventType =
   | 'spawned'
   | 'agent_idle'
   | 'agent_done'
+  | 'message'
   | 'system'
 
 export interface SwarmEvent {

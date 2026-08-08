@@ -137,6 +137,9 @@ async function main(): Promise<void> {
         hiveNames: true,
         maxAgents: 8,
         maxTotalTurns: 60,
+        // Nudge the overseer every few turns to actively survey its workers
+        // (chase stalls, reroute failures) instead of sleeping until an event.
+        heartbeatEveryTurns: 5,
         // Hold at the cap instead of ending, so bumping the turns slider in
         // the viewer resumes the same run. Stop from the hive to end it.
         holdAtCap: true,
