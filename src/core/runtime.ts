@@ -677,6 +677,58 @@ export class Swarm {
     this.paused = false
   }
 
+  /**
+   * Rebuild a read-only agent roster from the event log — for a swarm opened
+   * from disk for inspection, whose in-memory roster is gone. The log records
+   * who spawned (with role/parent/tier/adapter in meta), who finished, and
+   * everyone's last activity; that's enough for a faithful post-mortem view,
+   * though the swarm can't resume (no message histories). No-op if a roster
+   * already exists (a live/in-process swarm) or the run is active.
+   */
+  hydrateRosterFromLog(): void {
+    if (this.running || this.agents.size > 0) return
+    const events = this.log.query({ limit: Math.max(1, this.log.lastId()) })
+    const stub = (name: string): ModelAdapter => ({
+      name,
+      async turn() {
+        throw new Error('inspection swarm cannot run')
+      },
+    })
+    for (const evt of events) {
+      if (evt.type !== 'spawned') continue
+      const meta = evt.meta as { parent?: string | null; role?: string; tier?: TierName | null; adapter?: string }
+      const role = meta.role ?? (evt.body.includes(':') ? evt.body.slice(0, evt.body.indexOf(':')) : 'agent')
+      this.agents.set(evt.agent, {
+        spec: { name: evt.agent, role, prompt: '', subscriptions: [] },
+        status: 'idle',
+        parent: meta.parent ?? null,
+        adapter: stub(meta.adapter ?? 'unknown'),
+        tier: meta.tier ?? null,
+        turns: 0,
+        lastActivity: '(reconstructed from log)',
+        lastActivityAt: evt.ts,
+        summary: null,
+        messages: [],
+        subscriptions: [],
+        wakes: [],
+      })
+    }
+    // Second pass: fold in activity, turn counts, and terminal status.
+    for (const evt of events) {
+      const s = this.agents.get(evt.agent)
+      if (s === undefined) continue
+      s.lastActivityAt = evt.ts
+      if (evt.type === 'post' || evt.type === 'message' || evt.type === 'spawned') {
+        s.lastActivity = evt.body.replace(/\s+/g, ' ').slice(0, 120)
+        s.turns++
+      }
+      if (evt.type === 'agent_done') {
+        s.status = 'done'
+        s.summary = evt.body || s.summary
+      }
+    }
+  }
+
   /** The model catalog: every pooled adapter with its manifest and retired flag. */
   catalog(): ModelCatalogEntry[] {
     return [...this.adapterPool.values()].map(a => ({
@@ -791,7 +843,7 @@ export class Swarm {
       body: `${spec.role}: ${promptSummary}`,
       tags: [],
       refs: [],
-      meta: { parent, tier: resolved.tier, adapter: resolved.adapter.name },
+      meta: { parent, role: spec.role, tier: resolved.tier, adapter: resolved.adapter.name },
     })
     return { ok: true, name: spec.name }
   }
@@ -1244,6 +1296,27 @@ export class Swarm {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/**
+ * Open a persisted swarm read-only for inspection: its board and event log as
+ * written, plus a roster reconstructed from the log. It cannot run (the stub
+ * adapter throws) and never mutates the log — use it to view a finished or
+ * previous-process swarm without re-spawning anything into it.
+ */
+export function openSwarmForInspection(dbPath: string): Swarm {
+  const swarm = new Swarm({
+    dbPath,
+    adapter: {
+      name: 'inspection',
+      async turn() {
+        throw new Error('inspection swarm cannot run')
+      },
+    },
+    heartbeatEveryTurns: 0,
+  })
+  swarm.hydrateRosterFromLog()
+  return swarm
 }
 
 /** Best-effort provider label for adapters without a manifest (e.g. 'anthropic:claude-...'). */

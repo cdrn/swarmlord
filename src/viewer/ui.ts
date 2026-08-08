@@ -399,6 +399,40 @@ export const VIEWER_HTML: string = `<!doctype html>
   .ebody.open { display: block; -webkit-line-clamp: unset; color: var(--text); }
   .duplink { color: var(--faint); font-size: 10px; }
 
+  /* ---- agent-to-agent mail: correspondence reads amber against the greens ---- */
+  .t-message { color: var(--amber); border-color: rgba(232,180,79,0.5); background: rgba(232,180,79,0.08); }
+  .evt.mail {
+    border-left-color: rgba(232,180,79,0.55);
+    background: linear-gradient(90deg, rgba(232,180,79,0.07), rgba(232,180,79,0.015) 60%, transparent);
+  }
+  .evt.mail:hover { background: rgba(232,180,79,0.11); border-left-color: rgba(232,180,79,0.8); }
+  .evt.mail.spot-on { border-left-color: rgba(232,180,79,0.9); }
+  .mailglyph { color: var(--amber); margin-right: 4px; opacity: .85; }
+  /* routing indicator sits in the channel slot: sender -> recipient */
+  .eroute {
+    font-size: 10px; color: var(--amber); opacity: .9;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .eroute .rto { color: #f0cf8a; }
+  .eroute .rarrow { color: var(--faint); margin: 0 2px; }
+  /* mail-only feed toggle, sits with the channel tabs */
+  #mailtoggle {
+    background: none; border: 1px solid var(--border); color: var(--faint);
+    font: inherit; font-size: 11px; padding: 3px 9px; cursor: pointer;
+  }
+  #mailtoggle:hover { border-color: rgba(232,180,79,0.5); color: var(--amber); }
+  #mailtoggle.on { color: var(--amber); border-color: rgba(232,180,79,0.6); background: rgba(232,180,79,0.08); }
+  /* inbox badge on brood frames, sibling to the wakes badge */
+  .inbox {
+    background: rgba(232,180,79,0.16); color: var(--amber);
+    border: 1px solid rgba(232,180,79,0.5);
+    padding: 0 5px; border-radius: 8px; font-size: 10px;
+  }
+  /* inbox block inside the hover card */
+  #hovercard .hc-inbox { display: flex; align-items: baseline; gap: 6px; margin-top: 4px; font-size: 11px; }
+  #hovercard .hc-inbox .ifrom { color: var(--amber); flex-shrink: 0; }
+  #hovercard .hc-inbox .ibody { color: var(--dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   /* ---- settings drawer ---- */
   #gearbtn {
     background: none; border: 1px solid var(--border); color: var(--dim);
@@ -777,6 +811,7 @@ export const VIEWER_HTML: string = `<!doctype html>
     <div id="boardbar">
       <span class="coltitle bartitle">board</span>
       <span id="tabs"></span>
+      <button id="mailtoggle" title="show only agent-to-agent mail">&#9993; mail</button>
       <button id="agentchip" title="clear agent filter"></button>
       <button id="followbtn" class="on" title="auto-scroll to newest">FOLLOWING</button>
       <input id="filter" type="text" placeholder="filter…" spellcheck="false">
@@ -887,6 +922,7 @@ export const VIEWER_HTML: string = `<!doctype html>
   var feedHover = false;
   var activeChannel = null;      // null = All
   var filterText = '';
+  var mailOnly = false;          // feed filter: only 'message' (agent-to-agent) events
   var frames = {};               // agent name -> { el, activityEl, turnsEl, wakesEl, statusEl }
   var eventsById = {};           // id -> SwarmEvent (for pin body lookup)
   var agentsByName = {};         // agent name -> latest AgentSnapshot
@@ -971,7 +1007,8 @@ export const VIEWER_HTML: string = `<!doctype html>
     var meta = document.createElement('div'); meta.className = 'fmeta';
     var turns = document.createElement('span');
     var wakes = document.createElement('span'); wakes.className = 'wakes'; wakes.style.display = 'none';
-    meta.appendChild(turns); meta.appendChild(wakes);
+    var inbox = document.createElement('span'); inbox.className = 'inbox'; inbox.style.display = 'none';
+    meta.appendChild(turns); meta.appendChild(wakes); meta.appendChild(inbox);
     if (a.adapter) {
       var ad = document.createElement('span'); ad.className = 'fadapter';
       ad.textContent = a.adapter; ad.title = a.adapter;
@@ -993,7 +1030,7 @@ export const VIEWER_HTML: string = `<!doctype html>
     var vein = document.createElement('span'); vein.className = 'vein'; vein.style.display = 'none';
     wrap.appendChild(vein); wrap.appendChild(el);
     framesEl.appendChild(wrap);
-    return { el: el, wrap: wrap, veinEl: vein, tierEl: tier, activityEl: act, turnsEl: turns, wakesEl: wakes, statusEl: st, spawned: false };
+    return { el: el, wrap: wrap, veinEl: vein, tierEl: tier, activityEl: act, turnsEl: turns, wakesEl: wakes, inboxEl: inbox, statusEl: st, spawned: false };
   }
 
   function patchFrame(f, a) {
@@ -1013,6 +1050,14 @@ export const VIEWER_HTML: string = `<!doctype html>
       f.wakesEl.textContent = a.pendingWakes + ' wake' + (a.pendingWakes === 1 ? '' : 's');
     } else {
       f.wakesEl.style.display = 'none';
+    }
+    var mailCount = inboxFor(a.name).length;
+    if (mailCount > 0) {
+      f.inboxEl.style.display = '';
+      f.inboxEl.textContent = '\\u2709 ' + mailCount;
+      f.inboxEl.title = mailCount + ' mail received';
+    } else {
+      f.inboxEl.style.display = 'none';
     }
     if (a.tier) {
       f.tierEl.className = 'ftier tier-' + a.tier;
@@ -1096,6 +1141,19 @@ export const VIEWER_HTML: string = `<!doctype html>
     return Math.floor(m / 60) + 'h ago';
   }
 
+  // scan the already-loaded events for mail addressed TO this agent.
+  // cheap: derived from eventsById in memory, newest first, no fetch.
+  function inboxFor(name) {
+    var out = [];
+    for (var id in eventsById) {
+      if (!eventsById.hasOwnProperty(id)) continue;
+      var e = eventsById[id];
+      if (e.type === 'message' && e.meta && e.meta.to === name) out.push(e);
+    }
+    out.sort(function (a, b) { return b.id - a.id; });
+    return out;
+  }
+
   function lineageOf(a) {
     var chain = [a.name];
     var cur = a.parent, guard = 0;
@@ -1155,6 +1213,22 @@ export const VIEWER_HTML: string = `<!doctype html>
       hcLine('summary', null);
       var sum = document.createElement('div'); sum.className = 'hc-body'; sum.textContent = a.summary;
       hovercard.appendChild(sum);
+    }
+
+    var inbox = inboxFor(name);
+    if (inbox.length > 0) {
+      hcLine('inbox (' + inbox.length + ')', null);
+      for (var mi = 0; mi < inbox.length && mi < 4; mi++) {
+        var me = inbox[mi];
+        var mrow = document.createElement('div'); mrow.className = 'hc-inbox';
+        var mfrom = document.createElement('span'); mfrom.className = 'ifrom';
+        mfrom.textContent = '\\u2709 ' + me.agent;
+        var mexc = me.body.replace(/\\s+/g, ' ').slice(0, 54);
+        if (me.body.length > 54) mexc += '\\u2026';
+        var mbody = document.createElement('span'); mbody.className = 'ibody'; mbody.textContent = mexc; mbody.title = me.body;
+        mrow.appendChild(mfrom); mrow.appendChild(mbody);
+        hovercard.appendChild(mrow);
+      }
     }
 
     hcLine('recent', null);
@@ -1338,6 +1412,7 @@ export const VIEWER_HTML: string = `<!doctype html>
 
   // ---------- feed ----------
   function rowMatches(row) {
+    if (mailOnly && row.dataset.type !== 'message') return false;
     if (activeChannel !== null && row.dataset.channel !== activeChannel) return false;
     if (agentFilter !== null && row.dataset.agent !== agentFilter) return false;
     if (filterText !== '' && row.dataset.search.indexOf(filterText) === -1) return false;
@@ -1362,20 +1437,46 @@ export const VIEWER_HTML: string = `<!doctype html>
     if (recent.length > 12) recent.shift();
     $('feedEmpty').style.display = 'none';
 
+    var isMail = evt.type === 'message';
+    var mailTo = (isMail && evt.meta && evt.meta.to) ? evt.meta.to : null;
+
     var row = document.createElement('div');
-    row.className = 'evt';
+    row.className = 'evt' + (isMail ? ' mail' : '');
     if (spotAgent !== null) row.className += evt.agent === spotAgent ? ' spot-on' : ' spot-dim';
+    row.dataset.type = evt.type;
     row.dataset.channel = evt.channel || '';
     row.dataset.agent = evt.agent;
-    row.dataset.search = (evt.agent + ' ' + evt.type + ' ' + (evt.channel || '') + ' ' + evt.body + ' ' + evt.tags.join(' ')).toLowerCase();
+    row.dataset.search = (evt.agent + ' ' + evt.type + ' ' + (evt.channel || '') + ' ' +
+      (mailTo ? mailTo + ' ' : '') + evt.body + ' ' + evt.tags.join(' ')).toLowerCase();
 
     var id = document.createElement('span'); id.className = 'eid'; id.textContent = '#' + evt.id;
-    var badge = document.createElement('span'); badge.className = 'badge t-' + evt.type; badge.textContent = evt.type; badge.title = evt.type;
+    var badge = document.createElement('span'); badge.className = 'badge t-' + evt.type;
+    badge.textContent = isMail ? 'mail' : evt.type; badge.title = evt.type;
     var ag = document.createElement('span'); ag.className = 'eagent'; ag.textContent = evt.agent; ag.title = evt.agent;
-    var ch = document.createElement('span'); ch.className = 'echan';
-    ch.textContent = evt.channel ? '#' + evt.channel : '';
-    if (evt.channel) ch.title = '#' + evt.channel;
-    var body = document.createElement('div'); body.className = 'ebody'; body.textContent = evt.body;
+
+    // channel slot: normal events show #channel; mail shows a sender -> recipient route
+    var ch;
+    if (isMail) {
+      ch = document.createElement('span'); ch.className = 'eroute';
+      var rf = document.createElement('span'); rf.className = 'rfrom'; rf.textContent = evt.agent;
+      var rar = document.createElement('span'); rar.className = 'rarrow'; rar.textContent = '\\u2192';
+      var rt = document.createElement('span'); rt.className = 'rto'; rt.textContent = mailTo || '?';
+      ch.appendChild(rf); ch.appendChild(rar); ch.appendChild(rt);
+      ch.title = evt.agent + ' \\u2192 ' + (mailTo || 'unknown');
+    } else {
+      ch = document.createElement('span'); ch.className = 'echan';
+      ch.textContent = evt.channel ? '#' + evt.channel : '';
+      if (evt.channel) ch.title = '#' + evt.channel;
+    }
+
+    var body = document.createElement('div'); body.className = 'ebody';
+    if (isMail) {
+      var env = document.createElement('span'); env.className = 'mailglyph'; env.textContent = '\\u2709';
+      body.appendChild(env);
+      body.appendChild(document.createTextNode(evt.body));
+    } else {
+      body.textContent = evt.body;
+    }
     body.title = 'click to expand';
     body.onclick = function () { body.classList.toggle('open'); };
     if (evt.duplicateOf !== null) {
@@ -1472,6 +1573,11 @@ export const VIEWER_HTML: string = `<!doctype html>
     filterText = this.value.trim().toLowerCase();
     applyFilter();
   });
+  $('mailtoggle').onclick = function () {
+    mailOnly = !mailOnly;
+    this.className = mailOnly ? 'on' : '';
+    applyFilter();
+  };
 
   // ---------- settings drawer ----------
   var drawer = $('drawer');

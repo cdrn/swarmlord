@@ -141,4 +141,46 @@ describe('Hive', () => {
     expect(events.length).toBeGreaterThan(0)
     expect(events.some(e => e.type === 'agent_done')).toBe(true)
   })
+
+  it('reconstructs the roster from the log on reopen without mutating the log', async () => {
+    // A swarm that spawns a worker, then both complete — leaves a real roster.
+    const spawningSwarm = (dbPath: string): Swarm => {
+      let n = 0
+      const adapter = new MockAdapter(req => {
+        const who = /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+        if (who === 'overseer') {
+          n++
+          if (n === 1) {
+            return turnOf([{ name: 'spawn', input: { name: 'scout', role: 'scout', prompt: 'look' } }])
+          }
+          return turnOf([{ name: 'complete', input: { summary: 'overseer done' } }])
+        }
+        return turnOf([{ name: 'complete', input: { summary: 'scout done' } }])
+      })
+      return new Swarm({ adapter, dbPath, maxTotalTurns: 20 })
+    }
+
+    const hive = new Hive({ dir, createSwarm: spawningSwarm })
+    const rec = hive.create('Roster', 'spawn a scout and finish')
+    await hive.settled(rec.id)
+
+    const hive2 = new Hive({ dir, createSwarm: spawningSwarm })
+    const view = hive2.swarm(rec.id)!
+    const eventsBefore = view.log.lastId()
+
+    // Roster is reconstructed from the log, with roles/lineage/terminal status.
+    const roster = view.snapshot().agents
+    const names = roster.map(a => a.name)
+    expect(names).toContain('overseer')
+    expect(names).toContain('scout')
+    const scout = roster.find(a => a.name === 'scout')!
+    expect(scout.parent).toBe('overseer')
+    expect(scout.role).toBe('scout')
+    expect(scout.status).toBe('done')
+
+    // Reopening/inspecting must NOT append anything to the persisted log
+    // (the old bug re-spawned the librarian into finished swarms).
+    expect(view.log.lastId()).toBe(eventsBefore)
+    expect(view.snapshot().agents.length).toBe(roster.length)
+  })
 })

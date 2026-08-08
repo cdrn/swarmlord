@@ -7,6 +7,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { openSwarmForInspection } from './core/runtime.js'
 import type { Swarm, SwarmResult } from './core/runtime.js'
 
 export interface SwarmRecord {
@@ -35,6 +36,8 @@ export class Hive {
   private readonly createSwarm: (dbPath: string) => Swarm
   private readonly records = new Map<string, StoredRecord>()
   private readonly live = new Map<string, Swarm>()
+  /** Read-only inspection views over finished/previous-process swarm logs. */
+  private readonly views = new Map<string, Swarm>()
   private readonly runs = new Map<string, Promise<void>>()
 
   constructor(opts: HiveOptions) {
@@ -60,18 +63,21 @@ export class Hive {
   }
 
   /**
-   * The Swarm instance for a hive entry — the live one when running, else a
-   * lazily-opened view over its database (board and log readable; the
-   * in-memory agent roster of past runs is gone, the events are not).
+   * The Swarm instance for a hive entry — the live one when it's running or was
+   * created in this process, else a read-only inspection view opened over its
+   * database with the roster reconstructed from the log. Inspection views never
+   * run createSwarm (which would re-spawn agents into a finished swarm's log).
    */
   swarm(id: string): Swarm | null {
     if (!this.records.has(id)) return null
-    let s = this.live.get(id)
-    if (s === undefined) {
-      s = this.createSwarm(this.dbPath(id))
-      this.live.set(id, s)
+    const live = this.live.get(id)
+    if (live !== undefined) return live
+    let view = this.views.get(id)
+    if (view === undefined) {
+      view = openSwarmForInspection(this.dbPath(id))
+      this.views.set(id, view)
     }
-    return s
+    return view
   }
 
   /** Create a swarm and start it on the task. Returns immediately. */
@@ -134,14 +140,17 @@ export class Hive {
   delete(id: string): void {
     const record = this.mustGet(id)
     if (this.runs.has(id)) throw new Error(`swarm "${id}" is running — stop it before deleting`)
-    const s = this.live.get(id)
-    if (s !== undefined) {
-      try {
-        s.log.close()
-      } catch {
-        // already closed
+    // Close any open handle (live run or inspection view) before removing the db.
+    for (const cache of [this.live, this.views]) {
+      const s = cache.get(id)
+      if (s !== undefined) {
+        try {
+          s.log.close()
+        } catch {
+          // already closed
+        }
+        cache.delete(id)
       }
-      this.live.delete(id)
     }
     this.records.delete(record.id)
     rmSync(this.dbPath(id), { force: true })
