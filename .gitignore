@@ -6,3 +6,5 @@ dist/
 *.db-shm
 .DS_Store
 .env
+swarms/
+sl-smoke*

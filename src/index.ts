@@ -7,6 +7,12 @@ export * from './core/verbs.js'
 export * from './core/runtime.js'
 export * from './adapters/types.js'
 export * from './adapters/anthropic.js'
+// Adapters share helper names (parseResponse/toStopReason) that exist only for
+// their own tests — re-export just the public surface to avoid barrel clashes.
+export { OpenAIAdapter, OpenRouterAdapter } from './adapters/openai.js'
+export type { OpenAIAdapterOptions, OpenRouterAdapterOptions } from './adapters/openai.js'
+export { GeminiAdapter } from './adapters/gemini.js'
+export type { GeminiAdapterOptions } from './adapters/gemini.js'
 export * from './adapters/mock.js'
 export * from './patterns/librarian.js'
 export * from './viewer/server.js'

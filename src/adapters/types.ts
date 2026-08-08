@@ -27,9 +27,19 @@ export type NeutralMessage =
        * Opaque provider-native content for lossless replay. The Anthropic
        * adapter stores the raw response blocks here (thinking blocks carry
        * signatures that must be echoed back verbatim on tool-use
-       * continuations). Only meaningful to the adapter that produced it.
+       * continuations). Only meaningful to the adapter that produced it —
+       * see `providerAdapter`.
        */
       providerContent?: unknown
+      /**
+       * Name of the adapter that produced `providerContent`. The runtime sets
+       * this when recording a turn. An adapter MUST ignore providerContent
+       * whose tag isn't its own name and fall back to reconstructing the turn
+       * from text + toolCalls — otherwise replaying (e.g.) Anthropic thinking
+       * blocks through OpenAI would be malformed. This is what makes an
+       * agent's history safe to carry across a model switch.
+       */
+      providerAdapter?: string
     }
   | { role: 'tool_results'; results: Array<{ toolCallId: string; content: string; isError?: boolean }> }
 
@@ -51,7 +61,24 @@ export interface TurnResult {
   stopReason?: StopReason
 }
 
+/**
+ * Self-description a model publishes to the swarm so agents can choose it well.
+ * Written for the model that reads it, in the same spirit as a channel's
+ * purpose — `cautions` is where "strict guardrails, will refuse exploit
+ * analysis" or "weak at strict JSON" lives, in words a spawner can reason over.
+ */
+export interface ModelManifest {
+  provider: string
+  /** What this model is good at, e.g. 'code', 'long-horizon synthesis', 'vision'. */
+  strengths: string[]
+  /** Where it's weak or restricted — proficiency gaps and guardrail edges. */
+  cautions: string[]
+  costClass: 'cheap' | 'moderate' | 'expensive'
+}
+
 export interface ModelAdapter {
   readonly name: string
+  /** Optional self-description surfaced in the model catalog. */
+  readonly manifest?: ModelManifest
   turn(req: TurnRequest): Promise<TurnResult>
 }

@@ -1,5 +1,13 @@
 import Anthropic from '@anthropic-ai/sdk'
-import type { ModelAdapter, NeutralMessage, StopReason, ToolCall, TurnRequest, TurnResult } from './types.js'
+import type {
+  ModelAdapter,
+  ModelManifest,
+  NeutralMessage,
+  StopReason,
+  ToolCall,
+  TurnRequest,
+  TurnResult,
+} from './types.js'
 
 export interface AnthropicAdapterOptions {
   /** Default 'claude-opus-4-8'. */
@@ -13,16 +21,58 @@ export interface AnthropicAdapterOptions {
 const DEFAULT_MODEL = 'claude-opus-4-8'
 const DEFAULT_MAX_TOKENS = 16000
 
-/** Exported for tests. Maps a neutral message onto the Anthropic wire shape. */
-export function toAnthropicMessage(msg: NeutralMessage): Anthropic.MessageParam {
+/**
+ * Builds a manifest reflecting the configured Claude model. Cost class tracks
+ * the model family (Opus expensive, Sonnet moderate, Haiku cheap); the
+ * strengths/cautions are shared Claude traits — strong at code and long-horizon
+ * agentic work, with careful safety guardrails that can refuse exploit or other
+ * sensitive security content.
+ */
+function manifestFor(model: string): ModelManifest {
+  const m = model.toLowerCase()
+  const costClass: ModelManifest['costClass'] = m.includes('haiku')
+    ? 'cheap'
+    : m.includes('sonnet')
+      ? 'moderate'
+      : 'expensive'
+  const strengths = ['code', 'agentic / long-horizon tasks', 'careful reasoning', 'tool use', 'instruction following']
+  if (m.includes('haiku')) strengths.push('fast, cheap bulk work')
+  return {
+    provider: 'anthropic',
+    strengths,
+    cautions: [
+      'safety guardrails may refuse exploit development or other sensitive security content',
+      m.includes('haiku')
+        ? 'lighter model — weaker on deep synthesis and hard reasoning'
+        : 'expensive relative to lighter models — reserve for work that needs it',
+    ],
+    costClass,
+  }
+}
+
+const DEFAULT_ADAPTER_NAME = `anthropic:${DEFAULT_MODEL}`
+
+/**
+ * Exported for tests. Maps a neutral message onto the Anthropic wire shape.
+ *
+ * `adapterName` is this adapter's own name. providerContent is only replayed
+ * verbatim when it was produced by an Anthropic adapter (providerAdapter ===
+ * adapterName); a turn produced by another provider is reconstructed from
+ * text + toolCalls so a mid-history model switch never replays foreign blocks.
+ */
+export function toAnthropicMessage(
+  msg: NeutralMessage,
+  adapterName: string = DEFAULT_ADAPTER_NAME,
+): Anthropic.MessageParam {
   switch (msg.role) {
     case 'user':
       return { role: 'user', content: msg.content }
     case 'assistant': {
-      if (msg.providerContent !== undefined) {
+      if (msg.providerContent !== undefined && msg.providerAdapter === adapterName) {
         // Lossless replay: the raw response blocks include thinking /
         // redacted_thinking whose signatures are load-bearing and must be
-        // echoed back verbatim on tool-use continuations.
+        // echoed back verbatim on tool-use continuations. Only safe when this
+        // very adapter produced them.
         return { role: 'assistant', content: msg.providerContent as Anthropic.ContentBlockParam[] }
       }
       const content: Anthropic.ContentBlockParam[] = []
@@ -103,6 +153,7 @@ export function parseResponse(response: Anthropic.Message): TurnResult {
 export class AnthropicAdapter implements ModelAdapter {
   /** Includes the model so mixed-tier swarms are tellable apart in snapshots. */
   readonly name: string
+  readonly manifest: ModelManifest
 
   private readonly client: Anthropic
   private readonly model: string
@@ -114,6 +165,7 @@ export class AnthropicAdapter implements ModelAdapter {
     this.model = opts.model ?? DEFAULT_MODEL
     this.maxTokens = opts.maxTokens ?? DEFAULT_MAX_TOKENS
     this.name = `anthropic:${this.model}`
+    this.manifest = manifestFor(this.model)
   }
 
   async turn(req: TurnRequest): Promise<TurnResult> {
@@ -130,7 +182,7 @@ export class AnthropicAdapter implements ModelAdapter {
           input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
         }),
       ),
-      messages: req.messages.map(toAnthropicMessage),
+      messages: req.messages.map(msg => toAnthropicMessage(msg, this.name)),
     })
 
     return parseResponse(response)

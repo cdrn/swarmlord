@@ -9,7 +9,7 @@ import type { SubscriptionFilter } from './subscriptions.js'
 import type { ToolCall, ToolDef } from '../adapters/types.js'
 import type { EventLog } from './log.js'
 import type { Blackboard } from './board.js'
-import type { AgentSpec } from './runtime.js'
+import type { AgentSpec, ModelCatalogEntry } from './runtime.js'
 import { generateAgentName } from './names.js'
 
 export interface VerbContext {
@@ -21,6 +21,12 @@ export interface VerbContext {
   agentNames(): string[]
   /** The agent's current standing queries (for the no-subscription idle guard). */
   subscriptionsOf(agentName: string): SubscriptionFilter[]
+  /** The full model catalog with manifests and retired flags, for list_models. */
+  catalog(): ModelCatalogEntry[]
+  /** Retire a model so no new agents spawn on it; running agents continue. */
+  retireModel(name: string, by?: string, reason?: string): { ok: boolean; error?: string }
+  /** Undo a retire, making the model spawnable again. */
+  restoreModel(name: string, by?: string): { ok: boolean; error?: string }
 }
 
 export interface VerbResult {
@@ -62,6 +68,17 @@ const subscriptionProps = {
 } as const
 
 export const toolDefs: ToolDef[] = [
+  {
+    name: 'list_models',
+    description:
+      'List the model catalog: every model with its provider, strengths, cautions, ' +
+      'cost class, tiers, and whether it is retired. Check this BEFORE spawning so you ' +
+      'match the model to the work — a capable (often expensive) model for synthesis and ' +
+      'judgment, a cheap one for bulk or mechanical subtasks. Read the cautions: they are ' +
+      'the guardrails and weak spots (e.g. "refuses exploit analysis", "weak at strict ' +
+      'JSON"). Avoid spawning a model whose cautions warn against the task you are giving it.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
   {
     name: 'list_channels',
     description:
@@ -229,6 +246,13 @@ export const toolDefs: ToolDef[] = [
             "Match the tier to the work: don't burn heavy on a listing job, don't send light to synthesize. " +
             'Omit to let the swarm default decide.',
         },
+        model: {
+          type: 'string',
+          description:
+            'Exact model name from list_models to run the new agent on. Overrides tier. ' +
+            'Use when a specific model best fits the work (check its cautions first). ' +
+            'Omit to use tier or the swarm default.',
+        },
         role: { type: 'string', description: 'Short role, e.g. "researcher".' },
         prompt: { type: 'string', description: 'Role instructions; delivered as its first message.' },
         subscriptions: {
@@ -271,6 +295,31 @@ export const toolDefs: ToolDef[] = [
         summary: { type: 'string' },
       },
       required: ['summary'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'retire_model',
+    description:
+      'Coordinator power: retire a model that is consistently wrong for this swarm\'s ' +
+      'work — persistent refusals or poor-quality output — so no new agents spawn on it. ' +
+      'Already-running agents keep going. This is reversible: pass restore:true to bring ' +
+      'it back. Do not retire a model over a single correct refusal or one bad turn; ' +
+      'retire only when the pattern is clear.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        model: { type: 'string', description: 'Exact model name from list_models.' },
+        restore: {
+          type: 'boolean',
+          description: 'Restore a previously retired model instead of retiring it.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Why you are retiring it — recorded for the swarm.',
+        },
+      },
+      required: ['model'],
       additionalProperties: false,
     },
   },
@@ -335,6 +384,10 @@ export function executeVerb(ctx: VerbContext, agentName: string, call: ToolCall)
   const input = call.input ?? {}
   try {
     switch (call.name) {
+      case 'list_models': {
+        return ok({ models: ctx.catalog() })
+      }
+
       case 'list_channels': {
         return ok({ channels: ctx.board.catalog() })
       }
@@ -477,12 +530,17 @@ export function executeVerb(ctx: VerbContext, agentName: string, call: ToolCall)
           input.tier === 'heavy' || input.tier === 'standard' || input.tier === 'light'
             ? input.tier
             : undefined
+        const model =
+          typeof input.model === 'string' && input.model.trim() !== ''
+            ? input.model.trim()
+            : undefined
         const spec: AgentSpec = {
           name: requestedName !== '' ? requestedName : generateAgentName(ctx.agentNames()),
           role: reqString(input, 'role'),
           prompt: reqString(input, 'prompt'),
           subscriptions,
           tier,
+          model,
         }
         const result = ctx.spawn(agentName, spec)
         if (!result.ok) return err({ spawned: false, error: result.error })
@@ -531,6 +589,17 @@ export function executeVerb(ctx: VerbContext, agentName: string, call: ToolCall)
           meta: {},
         })
         return ok({ completed: true }, { statusChange: 'done', summary })
+      }
+
+      case 'retire_model': {
+        const model = reqString(input, 'model')
+        const reason = typeof input.reason === 'string' ? input.reason : undefined
+        const result =
+          input.restore === true
+            ? ctx.restoreModel(model, agentName)
+            : ctx.retireModel(model, agentName, reason)
+        if (!result.ok) return err({ ok: false, error: result.error })
+        return ok({ ok: true, model, restored: input.restore === true })
       }
 
       default:

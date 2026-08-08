@@ -46,8 +46,11 @@ src/
   core/runtime.ts        # Swarm — scheduling, spawning, subscription wakes
   viewer/ui.ts           # VIEWER_HTML — single-file page, hive home + swarm dashboard
   viewer/server.ts       # startViewer + startHive — node:http server + SSE over the log
-  adapters/types.ts      # ModelAdapter neutral interface                   (DONE)
+  adapters/types.ts      # ModelAdapter interface + ModelManifest           (DONE)
   adapters/anthropic.ts  # Claude adapter (@anthropic-ai/sdk)
+  adapters/openai.ts     # GPT adapter (openai)
+  adapters/gemini.ts     # Gemini adapter (@google/genai)
+  adapters/openrouter.ts # OpenRouter gateway (OpenAI-compatible; local via baseURL)
   adapters/mock.ts       # scripted adapter for tests/offline demo
   patterns/librarian.ts  # curator role built on the public verbs
   hive.ts                # Hive — durable multi-swarm manager over a directory of dbs
@@ -63,8 +66,10 @@ test/*.test.ts
   imports must use `.js` extensions** (`from './events.js'`).
 - Persistence via **`node:sqlite`** (`DatabaseSync`) — no native deps.
   FTS5 is available. `stmt.run/get/all`, `db.exec`, positional `?` params.
-- No runtime dependencies besides `@anthropic-ai/sdk` (used only by the
-  Anthropic adapter).
+- Runtime deps are provider SDKs only, each imported by a single adapter:
+  `@anthropic-ai/sdk` (Anthropic), `openai` (OpenAI + OpenRouter, which is
+  OpenAI-compatible), `@google/genai` (Gemini). The core runtime pulls in
+  none of them — it sees only the `ModelAdapter` interface.
 
 ## Public API contracts
 
@@ -203,7 +208,9 @@ Agent-facing verbs (tools). Results are JSON strings.
 | `pin` | `{event_id, unpin?}` | limited slots per agent; error lists current pins |
 | `claim` | `{event_id, join?, release?}` | informed claim / join / release |
 | `merge_channels` | `{from, to}` | alias from → to |
-| `spawn` | `{name?, role, prompt, subscriptions?}` | new agent; capped by maxAgents; omitted name is generated (core/names.ts) |
+| `list_models` | `{}` | the model catalog: each pooled model's provider, strengths, cautions, cost, retired flag |
+| `spawn` | `{name?, role, prompt, model?, tier?, subscriptions?}` | new agent on a chosen model/tier; capped by maxAgents; omitted name is generated (core/names.ts) |
+| `retire_model` | `{model, reason?, restore?}` | make a model unspawnable (or restore it); running agents keep going |
 | `idle` | `{reason?}` | sleep until a subscribed event arrives |
 | `complete` | `{summary}` | agent is done for good; summary recorded |
 
@@ -229,6 +236,92 @@ Runtime loop:
   once and reference elsewhere, spawn for parallelizable work, idle to wait,
   complete when finished.
 
+## Model choice, manifests, and replay-safety
+
+The swarm is provider-agnostic and, at runtime, provider-*mixed*: the default
+adapter, the tier adapters, and everything in `SwarmOptions.adapters` form a
+pool the swarm draws from. Every pooled adapter self-describes with a manifest,
+and agents pick per spawn.
+
+### Manifests and the catalog
+
+```ts
+export interface ModelManifest {
+  provider: string
+  strengths: string[]   // what it's good at: 'code', 'vision', 'long-horizon synthesis'
+  cautions: string[]    // weak spots AND guardrail edges — 'refuses exploit analysis', 'weak strict JSON'
+  costClass: 'cheap' | 'moderate' | 'expensive'
+}
+
+// One catalog row per pooled model, surfaced by list_models / Swarm.catalog().
+export interface ModelCatalogEntry {
+  name: string                 // the adapter's name, e.g. 'openai:gpt-5'
+  provider: string             // manifest.provider, or inferred from the name
+  strengths: string[]
+  cautions: string[]
+  costClass: 'cheap' | 'moderate' | 'expensive' | null   // null when no manifest
+  retired: boolean
+  isDefault: boolean           // the swarm-wide default adapter
+  tiers: string[]              // tier names currently pointing at this model
+}
+```
+
+`ModelManifest` is written *for the model that reads it*, same spirit as a
+channel purpose. `cautions` is the load-bearing field: it's where guardrail
+notes and proficiency gaps go, in words a spawning agent can reason over so it
+doesn't hand a model work its manifest warns against. An adapter with no
+manifest still appears in the catalog (empty strengths/cautions, `costClass:
+null`, provider inferred from `name`).
+
+Adapters take an optional `manifest` in their constructor options so the same
+adapter class can describe different deployments (e.g. an OpenRouter adapter
+pointed at Llama vs. a hosted frontier model). `Swarm.catalog()` reads
+`adapter.manifest` off each pooled adapter.
+
+### Choosing, and correcting a wrong choice
+
+- `list_models` returns `ModelCatalogEntry[]`. The `spawn` verb takes `model`
+  (a catalog name) or `tier` (heavy/standard/light); resolution order is
+  `spec.adapter > spec.model > spec.tier > weighted tier sample (agent spawns
+  only) > swarm default`. An unknown or retired model/tier errors back to the
+  spawner as a tool result.
+- **Refusal → respawn protocol.** When a turn's `stopReason` is `refusal`, the
+  runtime records a loud, tagged `refusal`/`model` system event naming the
+  model, then idles the agent. Refusals are never auto-retried past: the
+  overseer subscribes to them and *judges* — a capability/guardrail mismatch
+  means reroute the task onto a fitter model (respawn with a different
+  `model:`), a correct refusal is respected. There is no "retry on the next
+  model until one complies" path; that would launder a correct refusal.
+- **Retire / restore.** `retire_model` (verb) / `Swarm.retireModel(name)` marks
+  a model unspawnable: no new agent lands on it by name, tier, or sampling, but
+  agents already running on it finish. `restoreModel` reverses it. Both append
+  a `model`-tagged system event so the decision is on the record. The overseer
+  retires a model that is *persistently* wrong for this swarm — not on a single
+  refusal. `Swarm.configure({ retire: [...], restore: [...] })` does the same
+  from the operator side / viewer.
+
+### Cross-provider replay-safety
+
+An agent's message history must survive a model switch, so a turn recorded
+under one provider can be replayed to another. Two fields on the assistant
+`NeutralMessage` make this safe:
+
+- `providerContent` — opaque provider-native blocks for lossless replay
+  (Anthropic stores raw response blocks here; thinking/redacted_thinking
+  signatures are load-bearing and must be echoed back verbatim on tool-use
+  continuations).
+- `providerAdapter` — the **name of the adapter that produced** that
+  `providerContent`. The runtime sets it when recording each assistant turn
+  (`= state.adapter.name`).
+
+The rule every adapter's neutral→wire mapping follows: use `providerContent`
+**only** when `providerAdapter === this.name`; otherwise ignore it and
+reconstruct the turn from `content` (text) + `toolCalls`. So replaying an
+Anthropic turn (with thinking-block signatures) through the OpenAI adapter
+rebuilds a plain assistant message instead of shipping another provider's raw
+blocks — which would be malformed or leak signatures. This is what lets the
+overseer reroute an agent's task onto a different provider mid-history.
+
 ### `adapters/anthropic.ts`
 
 ```ts
@@ -246,6 +339,37 @@ export class AnthropicAdapter implements ModelAdapter { ... }
   `assistant` → text + `tool_use` blocks; `tool_results` → user turn of
   `tool_result` blocks. Parse response content blocks back to text +
   ToolCall[]. Narrow content blocks by `.type`.
+
+### `adapters/openai.ts`, `adapters/gemini.ts`, `adapters/openrouter.ts`
+
+Same options shape as Anthropic plus an optional per-instance manifest:
+
+```ts
+export interface OpenAIAdapterOptions {
+  model?: string
+  apiKey?: string       // default: SDK env resolution (OPENAI_API_KEY)
+  maxTokens?: number
+  baseURL?: string      // point at a local OpenAI-compatible server
+  manifest?: ModelManifest
+}
+export class OpenAIAdapter implements ModelAdapter { ... }      // name 'openai:<model>'
+export class GeminiAdapter implements ModelAdapter { ... }      // name 'gemini:<model>', @google/genai
+export class OpenRouterAdapter implements ModelAdapter { ... }  // OpenAI-compatible; env OPENROUTER_API_KEY, baseURL default OpenRouter's
+```
+
+- OpenAI / OpenRouter map onto the `openai` SDK (`client.chat.completions.
+  create`): neutral `assistant` → an assistant message with `content` +
+  `tool_calls` (function-call JSON args), `tool_results` → `role: 'tool'`
+  messages keyed by `tool_call_id`. Parse choices back to text + `ToolCall[]`;
+  map `finish_reason` (`stop`/`tool_calls` → complete, `length` → max_tokens,
+  content-filter/refusal → refusal).
+- Gemini maps onto `@google/genai` (`client.models.generateContent`): neutral
+  messages → `contents` (`role: 'user'|'model'`, `functionCall`/
+  `functionResponse` parts); parse candidate parts back to text + tool calls;
+  map a `SAFETY`/`PROHIBITED_CONTENT` finish to `refusal`.
+- All three honor the replay rule above: they read `providerContent` only when
+  `providerAdapter === this.name`, else rebuild from text + `toolCalls`. They
+  set `providerContent` on their own results for lossless same-provider replay.
 
 ### `adapters/mock.ts`
 

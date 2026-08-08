@@ -107,13 +107,11 @@ export class Hive {
     return { ...record, running: true }
   }
 
-  /** Soft-stop a running swarm: zero the turn cap, let the loop wind down. */
+  /** Stop a running swarm for good — the explicit terminate, cap-independent. */
   stop(id: string): SwarmRecord {
     const record = this.mustGet(id)
     const s = this.live.get(id)
-    if (s !== undefined && this.runs.has(id)) {
-      s.configure({ maxTotalTurns: 0, paused: false })
-    }
+    if (s !== undefined && this.runs.has(id)) s.stop()
     return { ...record, running: this.runs.has(id) }
   }
 

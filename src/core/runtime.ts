@@ -30,11 +30,25 @@ export interface AgentSpec {
   /**
    * Per-agent adapter override — e.g. a cheaper model for scouts while the
    * overseer runs the big one. Only settable from code (specs passed to
-   * spawn()/run()); the spawn verb can't reach it. Wins over `tier`.
+   * spawn()/run()); the spawn verb can't reach it. Wins over `model`/`tier`.
    */
   adapter?: ModelAdapter
+  /** Pooled model name (from the catalog). The spawn verb can set this; wins over `tier`. */
+  model?: string
   /** Named tier from SwarmOptions.tiers. The spawn verb can set this. */
   tier?: TierName
+}
+
+export interface ModelCatalogEntry {
+  name: string
+  provider: string
+  strengths: string[]
+  cautions: string[]
+  costClass: 'cheap' | 'moderate' | 'expensive' | null
+  retired: boolean
+  isDefault: boolean
+  /** Tier names currently pointing at this model. */
+  tiers: TierName[]
 }
 
 export interface SwarmOptions {
@@ -68,6 +82,13 @@ export interface SwarmOptions {
   adapters?: ModelAdapter[]
   /** Milliseconds to wait before each turn — throttle a swarm to watch it. */
   turnDelayMs?: number
+  /**
+   * When true, hitting maxTotalTurns pauses the run at the cap instead of
+   * ending it, so raising the cap (slider/configure) resumes the same run.
+   * The run then ends only on genuine quiescence or an explicit stop().
+   * Default false: the cap is a hard stop (safe for headless scripts).
+   */
+  holdAtCap?: boolean
   /**
    * When true, agent-initiated spawns always get generated hive names
    * (vexeth, skarnix, ...) regardless of the name the spawner asked for.
@@ -126,12 +147,16 @@ export interface SwarmConfigView {
   protocolAppendix: string
   paused: boolean
   turnDelayMs: number
+  holdAtCap: boolean
+  running: boolean
   hiveNames: boolean
   /** Configured tier name → adapter name. */
   tiers: Partial<Record<TierName, string>>
   tierWeights: Partial<Record<TierName, number>>
   /** Names of every adapter in the pool — assignable to tiers via configure(). */
   availableAdapters: string[]
+  /** The full model catalog with manifests and retired flags. */
+  models: ModelCatalogEntry[]
 }
 
 export interface SwarmConfigUpdate {
@@ -151,6 +176,14 @@ export interface SwarmConfigUpdate {
   protocolAppendix?: string
   /** Toggle forced hive names for agent-initiated spawns. */
   hiveNames?: boolean
+  /** Toggle hold-at-cap behavior live. */
+  holdAtCap?: boolean
+  /** Set true to end the run for good (the explicit terminate). */
+  stop?: boolean
+  /** Model names to retire (unspawnable; running agents keep going). */
+  retire?: string[]
+  /** Model names to restore (spawnable again). */
+  restore?: string[]
 }
 
 export interface SwarmSnapshot {
@@ -187,10 +220,15 @@ export const PROTOCOL_PREAMBLE = `You are one agent in a swarm coordinating thro
 5. Create channels sparingly. create_channel searches for near-matches first; prefer an existing channel over forcing a new one. Merge channels that have converged.
 6. Pin only what everyone must see. Pin slots are scarce on purpose.
 7. Spawn agents for parallelizable work. Give each a clear name, role, and prompt saying what to do, where to post, and to call complete when finished. Spawns are public events.
-8. Subscribe to what you must react to, then idle when you're waiting on others. You wake only on subscribed events — subscribe before you idle.
-9. Call complete with a summary (citing event ids) when your work is truly finished. Idle means waiting; complete means done for good.`
+8. Match the model to the work when you spawn. call list_models to see what's available — each model lists strengths, cautions, and cost. Pass model:<name> for a specific one, or tier (heavy/standard/light) for a coarse pick; omit both to accept the default. Read the cautions: some models have strict guardrails or weak spots, so don't hand a model a task its manifest warns against. Cheap models for scanning and bulk, capable models for synthesis and judgment.
+9. Subscribe to what you must react to, then idle when you're waiting on others. You wake only on subscribed events — subscribe before you idle.
+10. Call complete with a summary (citing event ids) when your work is truly finished. Idle means waiting; complete means done for good.`
 
-export const DEFAULT_ROOT_PROMPT = `You are the coordinator of this swarm. Break the task into independent workstreams and spawn a focused agent for each rather than doing everything yourself. Set up channels for the work (checking the catalog first), tell each spawned agent where to post, and subscribe to their channels and to agent_done events so their results wake you. While workers run, idle; when woken, read what arrived, integrate, redirect or spawn as needed. When the task is fulfilled, post a final synthesis citing the key event ids, then call complete with a summary.`
+export const DEFAULT_ROOT_PROMPT = `You are the coordinator of this swarm. Break the task into independent workstreams and spawn a focused agent for each rather than doing everything yourself. Consult list_models and choose a fitting model per worker — capable models for synthesis and judgment, cheap ones for scanning and bulk, and steer clear of a model whose cautions warn against the task. Set up channels for the work (checking the catalog first), tell each spawned agent where to post, and subscribe to their channels and to agent_done events so their results wake you.
+
+Watch for models that are a bad fit: if a worker's model refuses its task (a refusal event) or flounders, that's a signal the pick was wrong — respawn the task on a model whose manifest fits, and if a model is consistently wrong for this swarm's work, retire_model it so nothing else spawns on it. Don't reflexively retry a refusal on another model just to get past it: judge whether it was a capability gap (reroute) or a correct refusal (respect it).
+
+While workers run, idle; when woken, read what arrived, integrate, redirect or spawn as needed. When the task is fulfilled, post a final synthesis citing the key event ids, then call complete with a summary.`
 
 const DEFAULT_MAX_AGENTS = 32
 const DEFAULT_MAX_TOTAL_TURNS = 200
@@ -223,12 +261,16 @@ export class Swarm {
   private turnDelayMs: number
   private paused = false
   private running = false
+  private stopped = false
+  private holdAtCap: boolean
   private hiveNames: boolean
   private readonly rootDefaults: Partial<AgentSpec>
   private tiers: Partial<Record<TierName, ModelAdapter>>
   private tierWeights: Partial<Record<TierName, number>>
   /** Every adapter this swarm knows, by name — the pool tiers can draw from. */
   private readonly adapterPool = new Map<string, ModelAdapter>()
+  /** Retired models: kept in the pool (existing agents run on) but unspawnable. */
+  private readonly retired = new Set<string>()
   private readonly onEvent?: (evt: SwarmEvent) => void
   private readonly onTurn?: SwarmOptions['onTurn']
 
@@ -244,6 +286,7 @@ export class Swarm {
     this.protocolBase = opts.protocolPreamble ?? PROTOCOL_PREAMBLE
     this.protocolAppendix = opts.protocolAppendix ?? ''
     this.turnDelayMs = opts.turnDelayMs ?? 0
+    this.holdAtCap = opts.holdAtCap ?? false
     this.hiveNames = opts.hiveNames ?? false
     this.rootDefaults = opts.root ?? {}
     this.tiers = { ...opts.tiers }
@@ -284,12 +327,15 @@ export class Swarm {
       protocolAppendix: this.protocolAppendix,
       paused: this.paused,
       turnDelayMs: this.turnDelayMs,
+      holdAtCap: this.holdAtCap,
+      running: this.running,
       hiveNames: this.hiveNames,
       tiers: Object.fromEntries(
         TIER_NAMES.filter(t => this.tiers[t] !== undefined).map(t => [t, this.tiers[t]!.name]),
       ),
       tierWeights: { ...this.tierWeights },
       availableAdapters: [...this.adapterPool.keys()],
+      models: this.catalog(),
     }
   }
 
@@ -372,6 +418,20 @@ export class Swarm {
     }
     if (update.protocolAppendix !== undefined) this.protocolAppendix = update.protocolAppendix
     if (update.hiveNames !== undefined) this.hiveNames = update.hiveNames
+    if (update.holdAtCap !== undefined) this.holdAtCap = update.holdAtCap
+    if (update.retire !== undefined) {
+      for (const name of update.retire) {
+        const r = this.retireModel(name)
+        if (!r.ok) throw new Error(r.error)
+      }
+    }
+    if (update.restore !== undefined) {
+      for (const name of update.restore) {
+        const r = this.restoreModel(name)
+        if (!r.ok) throw new Error(r.error)
+      }
+    }
+    if (update.stop === true) this.stop()
     return this.config()
   }
 
@@ -446,6 +506,83 @@ export class Swarm {
     return result
   }
 
+  /**
+   * End the run for good — the real terminate, distinct from the turn cap.
+   * A holdAtCap swarm sitting at its cap only exits via this (or genuine
+   * quiescence); a plain cap raise resumes it instead.
+   */
+  stop(): void {
+    this.stopped = true
+    this.paused = false
+  }
+
+  /** The model catalog: every pooled adapter with its manifest and retired flag. */
+  catalog(): ModelCatalogEntry[] {
+    return [...this.adapterPool.values()].map(a => ({
+      name: a.name,
+      provider: a.manifest?.provider ?? providerFromName(a.name),
+      strengths: a.manifest?.strengths ?? [],
+      cautions: a.manifest?.cautions ?? [],
+      costClass: a.manifest?.costClass ?? null,
+      retired: this.retired.has(a.name),
+      isDefault: a.name === this.adapter.name,
+      tiers: TIER_NAMES.filter(t => this.tiers[t]?.name === a.name),
+    }))
+  }
+
+  /**
+   * Retire a model: no new agent can spawn onto it (by name, tier, or
+   * sampling), but agents already running on it continue. Reversible with
+   * restoreModel. Logged so the decision is on the record.
+   */
+  retireModel(name: string, by = 'operator', reason?: string): { ok: boolean; error?: string } {
+    if (!this.adapterPool.has(name)) {
+      return { ok: false, error: `unknown model "${name}" — pool: ${[...this.adapterPool.keys()].join(', ')}` }
+    }
+    if (!this.retired.has(name)) {
+      this.retired.add(name)
+      this.log.append({
+        type: 'system',
+        agent: by,
+        channel: null,
+        body: `retired model "${name}"${reason ? `: ${reason}` : ''} — no new agents will spawn on it`,
+        tags: ['model', 'retire'],
+        refs: [],
+        meta: { model: name, retired: true, reason: reason ?? null },
+      })
+      this.deliverNewEvents(null)
+    }
+    return { ok: true }
+  }
+
+  restoreModel(name: string, by = 'operator'): { ok: boolean; error?: string } {
+    if (!this.adapterPool.has(name)) {
+      return { ok: false, error: `unknown model "${name}"` }
+    }
+    if (this.retired.delete(name)) {
+      this.log.append({
+        type: 'system',
+        agent: by,
+        channel: null,
+        body: `restored model "${name}" — spawnable again`,
+        tags: ['model', 'restore'],
+        refs: [],
+        meta: { model: name, retired: false },
+      })
+      this.deliverNewEvents(null)
+    }
+    return { ok: true }
+  }
+
+  /** Any agent ready now, or idle with a queued wake — i.e. work remains. */
+  private hasPendingWork(): boolean {
+    for (const s of this.agents.values()) {
+      if (s.status === 'ready') return true
+      if (s.status === 'idle' && s.wakes.length > 0) return true
+    }
+    return false
+  }
+
   private spawnInternal(
     parent: string | null,
     spec: AgentSpec,
@@ -508,7 +645,23 @@ export class Swarm {
     spec: AgentSpec,
     source: 'code' | 'agent',
   ): { adapter: ModelAdapter; tier: TierName | null } {
+    // A code caller passing an adapter object directly is authoritative —
+    // retirement only gates pool/tier/sampling picks.
     if (spec.adapter) return { adapter: spec.adapter, tier: spec.tier ?? null }
+
+    // Explicit model by name (from the spawn verb).
+    if (spec.model !== undefined) {
+      const adapter = this.adapterPool.get(spec.model)
+      if (adapter === undefined) {
+        throw new Error(
+          `unknown model "${spec.model}" — available: ${this.spawnableNames().join(', ') || '(none)'}`,
+        )
+      }
+      if (this.retired.has(spec.model)) {
+        throw new Error(`model "${spec.model}" is retired — pick another: ${this.spawnableNames().join(', ')}`)
+      }
+      return { adapter, tier: spec.tier ?? null }
+    }
 
     if (spec.tier !== undefined) {
       const adapter = this.tiers[spec.tier]
@@ -520,13 +673,23 @@ export class Swarm {
             : `unknown tier "${spec.tier}" — configured tiers: ${configured.join(', ')}`,
         )
       }
+      if (this.retired.has(adapter.name)) {
+        throw new Error(
+          `tier "${spec.tier}" points at retired model "${adapter.name}" — reassign the tier or pick another`,
+        )
+      }
       return { adapter, tier: spec.tier }
     }
 
     const weighted =
       source === 'code'
         ? []
-        : TIER_NAMES.filter(t => this.tiers[t] !== undefined && (this.tierWeights[t] ?? 0) > 0)
+        : TIER_NAMES.filter(
+            t =>
+              this.tiers[t] !== undefined &&
+              (this.tierWeights[t] ?? 0) > 0 &&
+              !this.retired.has(this.tiers[t]!.name),
+          )
     if (weighted.length > 0) {
       const total = weighted.reduce((sum, t) => sum + this.tierWeights[t]!, 0)
       let roll = Math.random() * total
@@ -538,7 +701,18 @@ export class Swarm {
       return { adapter: this.tiers[last]!, tier: last }
     }
 
-    return { adapter: this.adapter, tier: null }
+    // Fall back to the swarm default — unless it too is retired, in which case
+    // pick any spawnable model rather than silently using a retired one.
+    if (!this.retired.has(this.adapter.name)) return { adapter: this.adapter, tier: null }
+    for (const a of this.adapterPool.values()) {
+      if (!this.retired.has(a.name)) return { adapter: a, tier: null }
+    }
+    throw new Error('every model is retired — restore one before spawning')
+  }
+
+  /** Pooled model names that aren't retired. */
+  private spawnableNames(): string[] {
+    return [...this.adapterPool.keys()].filter(n => !this.retired.has(n))
   }
 
   async run(task: string, root?: Partial<AgentSpec>): Promise<SwarmResult> {
@@ -556,12 +730,23 @@ export class Swarm {
     const finalSummaries: Record<string, string> = {}
 
     this.running = true
+    this.stopped = false
     try {
       outer: while (true) {
         // Paused swarms hold here — no turns, and no termination either, so
         // an operator can pause, message agents, and resume.
-        while (this.paused) await sleep(150)
-        if (this.turnsTaken >= this.maxTotalTurns) break
+        while (this.paused && !this.stopped) await sleep(150)
+        if (this.stopped) break
+
+        if (this.turnsTaken >= this.maxTotalTurns) {
+          // At the turn cap. With holdAtCap the run doesn't die — it waits
+          // here so raising the cap (or an operator direct message) resumes
+          // it, and only ends when the swarm goes quiescent or is stopped.
+          // Without holdAtCap the cap is a hard stop (headless default).
+          if (!this.holdAtCap || !this.hasPendingWork()) break
+          await sleep(150)
+          continue
+        }
 
         // Idle agents with queued wakes become ready again.
         for (const state of this.agents.values()) {
@@ -571,8 +756,9 @@ export class Swarm {
         if (ready.length === 0) break
 
         for (const state of ready) {
-          while (this.paused) await sleep(150)
-          if (this.turnsTaken >= this.maxTotalTurns) break outer
+          while (this.paused && !this.stopped) await sleep(150)
+          if (this.stopped) break outer
+          if (this.turnsTaken >= this.maxTotalTurns) break // re-evaluate cap at top
           if (state.status !== 'ready') continue
           if (this.turnDelayMs > 0) await sleep(this.turnDelayMs)
           const summary = await this.takeTurn(state)
@@ -667,6 +853,18 @@ export class Swarm {
     if (stopReason === 'refusal') {
       state.messages.push({ role: 'assistant', content: result.text, toolCalls: [] })
       state.status = 'idle'
+      // Loud, tagged, and attributed to the model — this is the signal the
+      // overseer watches to reroute a wrong-fit model onto a fitter one.
+      this.log.append({
+        type: 'system',
+        agent: name,
+        channel: null,
+        body: `model "${state.adapter.name}" refused ${name}'s task — its manifest may guardrail this work; consider respawning on a fitter model`,
+        tags: ['refusal', 'model'],
+        refs: [],
+        meta: { stopReason, model: state.adapter.name, tier: state.tier },
+      })
+      state.status = 'idle'
       this.log.append({
         type: 'agent_idle',
         agent: name,
@@ -691,6 +889,9 @@ export class Swarm {
       content: result.text,
       toolCalls: result.toolCalls,
       providerContent: result.providerContent,
+      // Tag with the producing adapter so a later model switch replays this
+      // turn from text+toolCalls instead of another provider's raw blocks.
+      providerAdapter: state.adapter.name,
     })
 
     let summary: string | null = null
@@ -730,6 +931,9 @@ export class Swarm {
         },
         agentNames: () => [...this.agents.keys()],
         subscriptionsOf: agentName => this.agents.get(agentName)?.subscriptions ?? [],
+        catalog: () => this.catalog(),
+        retireModel: (n, by, reason) => this.retireModel(n, by, reason),
+        restoreModel: (n, by) => this.restoreModel(n, by),
       }
       const results: Array<{ toolCallId: string; content: string; isError?: boolean }> = []
       for (const call of result.toolCalls) {
@@ -836,6 +1040,12 @@ export class Swarm {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/** Best-effort provider label for adapters without a manifest (e.g. 'anthropic:claude-...'). */
+function providerFromName(name: string): string {
+  const colon = name.indexOf(':')
+  return colon > 0 ? name.slice(0, colon) : name
 }
 
 function describeToolCalls(calls: ToolCall[]): string {

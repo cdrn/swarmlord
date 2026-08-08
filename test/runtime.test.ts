@@ -4,9 +4,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Swarm } from '../src/core/runtime.js'
 import { EventLog } from '../src/core/log.js'
-import { MockAdapter, turnOf } from '../src/adapters/mock.js'
-import type { TurnRequest } from '../src/adapters/types.js'
+import { MockAdapter, turnOf, type MockHandler } from '../src/adapters/mock.js'
+import type { ModelAdapter, ModelManifest, TurnRequest } from '../src/adapters/types.js'
 import type { SwarmEvent } from '../src/core/events.js'
+
+/** A named MockAdapter, optionally carrying a manifest — for catalog/routing tests. */
+function namedMock(name: string, handler: MockHandler, manifest?: ModelManifest): ModelAdapter {
+  const a = new MockAdapter(handler)
+  Object.defineProperty(a, 'name', { value: name })
+  if (manifest !== undefined) Object.defineProperty(a, 'manifest', { value: manifest })
+  return a
+}
 
 // Agent prompts carry a ROLE:<name> marker; it shows up in the system prompt
 // (role prompt appended) and/or the first user message, so check both.
@@ -527,6 +535,49 @@ describe('Swarm runtime', () => {
     expect(opEvents.some(e => e.body.includes('operator → overseer'))).toBe(true)
   })
 
+  it('holds at the turn cap and resumes when the cap is raised (holdAtCap)', async () => {
+    let swarm: Swarm
+    let turns = 0
+    let raised = false
+    const adapter = new MockAdapter(() => {
+      turns++
+      // A worker that never idles/completes — only the cap can stop it. Once
+      // parked at the cap, an out-of-band configure() raise should resume it.
+      if (turns >= 2 && !raised) {
+        raised = true
+        // Fire after this turn returns, while the loop is holding at the cap.
+        setTimeout(() => swarm.configure({ maxTotalTurns: 4 }), 0)
+      }
+      if (turns >= 4) return turnOf([{ name: 'complete', input: { summary: 'done at 4' } }])
+      return turnOf([{ name: 'post', input: { channel: 'x', body: `turn ${turns}` } }])
+    })
+
+    swarm = new Swarm({ adapter, maxTotalTurns: 2, holdAtCap: true })
+    // Pre-make the channel so posts don't error.
+    swarm.board.createChannel('overseer', { name: 'x', purpose: 'busywork', tags: [] })
+    const result = await swarm.run('run past the cap')
+
+    // Without holdAtCap this would have ended at 2; the raise let it reach 4.
+    expect(result.turns).toBe(4)
+    expect(result.finalSummaries.overseer).toBe('done at 4')
+  })
+
+  it('stop() ends a holdAtCap run parked at the cap', async () => {
+    let swarm: Swarm
+    let turns = 0
+    const adapter = new MockAdapter(() => {
+      turns++
+      if (turns >= 2) setTimeout(() => swarm.stop(), 0) // stop while it holds
+      return turnOf([{ name: 'post', input: { channel: 'x', body: `t${turns}` } }])
+    })
+
+    swarm = new Swarm({ adapter, maxTotalTurns: 2, holdAtCap: true })
+    swarm.board.createChannel('overseer', { name: 'x', purpose: 'busywork', tags: [] })
+    const result = await swarm.run('hold then stop')
+
+    expect(result.turns).toBe(2) // held at the cap, then stop() terminated it
+  })
+
   it('lifts caps via null and reassigns tiers from the adapter pool', () => {
     const spare = new MockAdapter(() => turnOf([]))
     Object.defineProperty(spare, 'name', { value: 'spare-model' })
@@ -619,5 +670,153 @@ describe('Swarm runtime', () => {
     expect(result.agents).toContain(payload.name)
     // Code-level spawns keep the name they were given.
     expect(result.agents).toContain('kept')
+  })
+
+  it('retires a model via configure(): spawns onto it and tiers pointing at it error, restore fixes it', () => {
+    const heavy = namedMock('heavy-model', () => turnOf([]), {
+      provider: 'anthropic',
+      strengths: ['synthesis'],
+      cautions: [],
+      costClass: 'expensive',
+    })
+    const cheap = namedMock('cheap-model', () => turnOf([]), {
+      provider: 'openai',
+      strengths: ['scanning'],
+      cautions: ['weak strict json'],
+      costClass: 'cheap',
+    })
+
+    const swarm = new Swarm({
+      adapter: namedMock('default-model', () => turnOf([])),
+      tiers: { heavy },
+      adapters: [cheap],
+      maxAgents: 50,
+    })
+
+    // Baseline: both a by-name spawn and a heavy-tier spawn work.
+    expect(swarm.spawn(null, { name: 'a', role: 'r', prompt: 'p', model: 'cheap-model' }).ok).toBe(true)
+    expect(swarm.spawn(null, { name: 'b', role: 'r', prompt: 'p', tier: 'heavy' }).ok).toBe(true)
+
+    // Retire via configure(). The verb path (retireModel) shares this logic.
+    swarm.configure({ retire: ['cheap-model', 'heavy-model'] })
+
+    const byName = swarm.spawn(null, { name: 'c', role: 'r', prompt: 'p', model: 'cheap-model' })
+    expect(byName.ok).toBe(false)
+    expect(byName.error).toMatch(/retired/i)
+
+    const byTier = swarm.spawn(null, { name: 'd', role: 'r', prompt: 'p', tier: 'heavy' })
+    expect(byTier.ok).toBe(false)
+    expect(byTier.error).toMatch(/retired/i)
+
+    // Restore re-enables both.
+    swarm.configure({ restore: ['cheap-model', 'heavy-model'] })
+    expect(swarm.spawn(null, { name: 'e', role: 'r', prompt: 'p', model: 'cheap-model' }).ok).toBe(true)
+    expect(swarm.spawn(null, { name: 'f', role: 'r', prompt: 'p', tier: 'heavy' }).ok).toBe(true)
+
+    // Retiring an unknown model surfaces an error through configure().
+    expect(() => swarm.configure({ retire: ['no-such-model'] })).toThrow(/unknown/i)
+  })
+
+  it('catalog() reflects manifests, the default/tier flags, and retired state', () => {
+    const heavy = namedMock('heavy-model', () => turnOf([]), {
+      provider: 'anthropic',
+      strengths: ['deep synthesis'],
+      cautions: ['expensive'],
+      costClass: 'expensive',
+    })
+    const cheap = namedMock('cheap-model', () => turnOf([]), {
+      provider: 'google',
+      strengths: ['vision', 'long context'],
+      cautions: ['distinct safety filters'],
+      costClass: 'cheap',
+    })
+    const bare = namedMock('openrouter:some/model', () => turnOf([])) // no manifest
+
+    const swarm = new Swarm({
+      adapter: namedMock('default-model', () => turnOf([])),
+      tiers: { heavy },
+      adapters: [cheap, bare],
+    })
+
+    const catalog = swarm.catalog()
+    const byName = Object.fromEntries(catalog.map(e => [e.name, e]))
+
+    // Manifest fields surface verbatim.
+    expect(byName['cheap-model']?.strengths).toEqual(['vision', 'long context'])
+    expect(byName['cheap-model']?.cautions).toEqual(['distinct safety filters'])
+    expect(byName['cheap-model']?.costClass).toBe('cheap')
+    expect(byName['cheap-model']?.provider).toBe('google')
+
+    // The default and tier flags.
+    expect(byName['default-model']?.isDefault).toBe(true)
+    expect(byName['cheap-model']?.isDefault).toBe(false)
+    expect(byName['heavy-model']?.tiers).toContain('heavy')
+    expect(byName['default-model']?.tiers).toEqual([])
+
+    // A manifest-less adapter still appears: empty arrays, null cost, inferred provider.
+    expect(byName['openrouter:some/model']?.strengths).toEqual([])
+    expect(byName['openrouter:some/model']?.costClass).toBeNull()
+    expect(byName['openrouter:some/model']?.provider).toBe('openrouter')
+
+    // Retired flag tracks retirement.
+    expect(byName['cheap-model']?.retired).toBe(false)
+    swarm.retireModel('cheap-model')
+    expect(swarm.catalog().find(e => e.name === 'cheap-model')?.retired).toBe(true)
+
+    // config().models mirrors the catalog.
+    expect(swarm.config().models.find(e => e.name === 'cheap-model')?.retired).toBe(true)
+  })
+
+  it('spawn with model:<name> routes the agent to that adapter in the pool', async () => {
+    const seenBy: Record<string, string[]> = { alpha: [], beta: [], root: [] }
+    const agentIn = (req: TurnRequest) => /Your name is "([^"]+)"/.exec(req.system)?.[1] ?? '?'
+
+    const alpha = namedMock(
+      'alpha-model',
+      req => {
+        seenBy.alpha!.push(agentIn(req))
+        return turnOf([{ name: 'complete', input: { summary: 'alpha ran' } }])
+      },
+      { provider: 'openai', strengths: ['tools'], cautions: [], costClass: 'moderate' },
+    )
+    const beta = namedMock(
+      'beta-model',
+      req => {
+        seenBy.beta!.push(agentIn(req))
+        return turnOf([{ name: 'complete', input: { summary: 'beta ran' } }])
+      },
+      { provider: 'google', strengths: ['vision'], cautions: [], costClass: 'cheap' },
+    )
+
+    let rootTurns = 0
+    const rootAdapter = new MockAdapter(req => {
+      seenBy.root!.push(agentIn(req))
+      rootTurns++
+      if (rootTurns === 1) {
+        return turnOf([
+          { name: 'spawn', input: { name: 'wa', role: 'w', prompt: 'p', model: 'alpha-model' } },
+          { name: 'spawn', input: { name: 'wb', role: 'w', prompt: 'p', model: 'beta-model' } },
+        ])
+      }
+      return turnOf([{ name: 'complete', input: { summary: 'root done' } }])
+    })
+
+    const swarm = new Swarm({ adapter: rootAdapter, adapters: [alpha, beta], maxTotalTurns: 20 })
+    const result = await swarm.run('route by model name')
+
+    // Each worker ran on the adapter named in its spawn — and nowhere else.
+    expect(seenBy.alpha).toContain('wa')
+    expect(seenBy.beta).toContain('wb')
+    expect(seenBy.alpha).not.toContain('wb')
+    expect(seenBy.beta).not.toContain('wa')
+    expect(seenBy.root).not.toContain('wa')
+
+    expect(result.finalSummaries.wa).toBe('alpha ran')
+    expect(result.finalSummaries.wb).toBe('beta ran')
+
+    // Snapshots report the routed adapter name.
+    const frames = Object.fromEntries(swarm.snapshot().agents.map(a => [a.name, a]))
+    expect(frames.wa?.adapter).toBe('alpha-model')
+    expect(frames.wb?.adapter).toBe('beta-model')
   })
 })

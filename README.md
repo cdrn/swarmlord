@@ -214,6 +214,69 @@ catch-all subscriptions never match them, so idle chatter can't livelock the
 swarm. Idling with no subscriptions at all is refused: the agent is told to
 subscribe first or call `complete`.
 
+## Providers and model choice
+
+A swarm member is anything implementing `ModelAdapter` — a system prompt, a
+message history, and a tool list in, text plus tool calls out. Any provider
+fits; the runtime never sees an SDK.
+
+```ts
+interface ModelAdapter {
+  readonly name: string
+  readonly manifest?: ModelManifest
+  turn(req: TurnRequest): Promise<TurnResult>
+}
+```
+
+Built-in adapters, all with the same constructor shape (`{ model?, apiKey?,
+maxTokens? }`, plus an optional `manifest` override):
+
+- `AnthropicAdapter` — Claude (`@anthropic-ai/sdk`).
+- `OpenAIAdapter` — GPT (`openai`).
+- `GeminiAdapter` — Gemini (`@google/genai`).
+- `OpenRouterAdapter` — a gateway to many models behind one key. Point `model`
+  at any OpenRouter slug. It's OpenAI-compatible, so a **local** server (Ollama,
+  vLLM, LM Studio) works the same way — set `baseURL` on `OpenRouterAdapter` (or
+  `OpenAIAdapter`) at the local endpoint and use its model name.
+
+Each adapter publishes a `ModelManifest` so agents can choose it well:
+
+```ts
+interface ModelManifest {
+  provider: string
+  strengths: string[]   // 'code', 'long-horizon synthesis', 'vision', ...
+  cautions: string[]    // where it's weak or restricted — guardrail edges live here
+  costClass: 'cheap' | 'moderate' | 'expensive'
+}
+```
+
+`cautions` is the important field: it's where "strict guardrails, refuses
+exploit analysis" or "weak at strict JSON" lives, in words a spawner reasons
+over. Put non-default adapters in `SwarmOptions.adapters` (see
+`examples/hive.ts`, which adds OpenAI/Gemini/OpenRouter when their keys are
+present); tiers can also point at any of them.
+
+**How an agent chooses.** `list_models` returns the catalog — every pooled
+model with its provider, strengths, cautions, cost, and whether it's retired.
+The agent then spawns with `model:<name>` for a specific pick or `tier:` for a
+coarse one (omit both to accept the default), reading the cautions so it never
+hands a model a task its manifest warns against.
+
+**When a pick is wrong.** A model that refuses (its manifest guardrails the
+work) produces a loud, tagged `refusal` event attributed to that model, and the
+agent is idled — refusals are *not* auto-retried past. The overseer watches for
+them: it judges whether it was a capability gap (reroute the task onto a fitter
+model) or a correct refusal (respect it), and if a model is *persistently*
+wrong for this swarm's work it calls `retire_model` so nothing else spawns on
+it (running agents finish; `restore` re-enables it).
+
+**Across a model switch.** An agent's history is safe to carry between
+providers: every recorded assistant turn is tagged with the adapter that
+produced it, and an adapter replays another provider's raw blocks only when the
+tag is its own — otherwise it reconstructs the turn from plain text plus tool
+calls, so (e.g.) Anthropic thinking-block signatures never leak into an OpenAI
+request.
+
 ## The verbs
 
 Agents see the substrate through ten tools:
@@ -228,7 +291,9 @@ Agents see the substrate through ten tools:
 | `pin` | `{event_id, unpin?}` | limited slots per agent; error lists current pins |
 | `claim` | `{event_id, join?, release?}` | informed claim / join / release |
 | `merge_channels` | `{from, to}` | alias `from` → `to` |
-| `spawn` | `{name, role, prompt, subscriptions?}` | new agent; capped by `maxAgents` |
+| `list_models` | `{}` | model catalog: provider, strengths, cautions, cost, retired flag |
+| `spawn` | `{name?, role, prompt, model?, tier?, subscriptions?}` | new agent on a chosen model/tier; capped by `maxAgents` |
+| `retire_model` | `{model, reason?, restore?}` | make a model unspawnable (or `restore` it); running agents keep going |
 | `idle` | `{reason?}` | sleep until a subscribed event arrives |
 | `complete` | `{summary}` | agent is done for good; summary recorded |
 
@@ -257,8 +322,9 @@ Agents see the substrate through ten tools:
 - **Patterns** (`patterns/`) — roles built entirely on the public verbs. The
   librarian is the first; it has no privileged API.
 - **Your swarm** — agent specs, role prompts, and subscriptions composed on
-  top. Any model works via the `ModelAdapter` interface; Anthropic and mock
-  adapters ship in the box.
+  top. Any model works via the `ModelAdapter` interface; Anthropic, OpenAI,
+  Gemini, OpenRouter (+ local via an OpenAI-compatible `baseURL`), and mock
+  adapters ship in the box. See *Providers and model choice* above.
 
 ## Status
 

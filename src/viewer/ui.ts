@@ -473,6 +473,77 @@ export const VIEWER_HTML: string = `<!doctype html>
   .secmsg { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .secmsg.ok { color: var(--green); }
   .secmsg.err { color: var(--magenta); }
+  /* ---- sticky apply-all foot ---- */
+  .drawerfoot {
+    flex-shrink: 0; display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border-top: 1px solid var(--border-bright);
+    background: rgba(13,10,18,0.92);
+    box-shadow: 0 -10px 20px rgba(0,0,0,0.35);
+  }
+  #apply-all {
+    flex: 1;
+    background: rgba(125,255,94,0.06); border: 1px solid var(--green-dim); color: var(--green);
+    font: inherit; font-weight: 800; font-size: 12px; letter-spacing: 3px;
+    padding: 9px; cursor: pointer;
+    transition: background .2s, border-color .2s;
+  }
+  #apply-all:hover { background: rgba(125,255,94,0.14); }
+  #apply-all:disabled { opacity: .5; cursor: default; }
+  #msg-all { flex-shrink: 0; max-width: 130px; }
+  /* ---- checkbox rows (hold at cap, hive names) ---- */
+  .chkrow {
+    display: flex; align-items: center; gap: 8px; margin: 6px 0;
+    color: var(--dim); font-size: 11px; cursor: pointer; user-select: none;
+  }
+  .chkrow input { accent-color: var(--green); cursor: pointer; flex-shrink: 0; }
+  /* ---- hold-at-cap header note ---- */
+  #capnote {
+    display: none; color: var(--amber); font-size: 10px; letter-spacing: .5px;
+    white-space: nowrap;
+  }
+  #capnote.show { display: inline; }
+  /* ---- model catalog ---- */
+  .modelrow {
+    position: relative;
+    border: 1px solid var(--border); border-left: 2px solid var(--border-bright);
+    background: rgba(13,10,18,0.4);
+    padding: 7px 9px; margin-bottom: 7px;
+    transition: opacity .2s, filter .2s;
+  }
+  .modelrow.retired { opacity: .5; filter: saturate(.4); }
+  .mrhead { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+  .mrname { font-weight: 700; color: var(--text); font-size: 12px; }
+  .modelrow.retired .mrname { text-decoration: line-through; }
+  .mrprov { color: var(--dim); font-size: 10px; }
+  .mrcost {
+    font-size: 9px; letter-spacing: .5px; border: 1px solid; padding: 0 4px;
+    white-space: nowrap;
+  }
+  .mrcost.cost-cheap     { color: var(--green);   border-color: rgba(125,255,94,0.4);  background: rgba(125,255,94,0.08); }
+  .mrcost.cost-moderate  { color: #a98fd6;        border-color: rgba(151,113,209,0.5); background: rgba(151,113,209,0.10); }
+  .mrcost.cost-expensive { color: var(--magenta); border-color: rgba(225,63,174,0.5);  background: rgba(225,63,174,0.10); }
+  .mrdefault {
+    font-size: 9px; letter-spacing: 1px; color: var(--amber);
+    border: 1px solid rgba(232,180,79,0.4); padding: 0 4px; white-space: nowrap;
+  }
+  .mrbtn {
+    margin-left: auto; flex-shrink: 0;
+    background: none; border: 1px solid var(--border); color: var(--dim);
+    font: inherit; font-size: 10px; letter-spacing: 1px; padding: 2px 9px; cursor: pointer;
+  }
+  .mrbtn:hover { border-color: var(--green-dim); color: var(--text); }
+  .mrbtn.retire:hover { border-color: rgba(225,63,174,0.6); color: var(--magenta); }
+  .mrtiers { display: flex; gap: 4px; margin-top: 5px; flex-wrap: wrap; }
+  .mrmanifest { margin-top: 5px; }
+  .mrmanifest summary {
+    cursor: pointer; user-select: none;
+    color: var(--faint); font-size: 10px; letter-spacing: 1px; padding: 2px 0;
+  }
+  .mrmanifest summary:hover { color: var(--dim); }
+  .mrtrait { font-size: 11px; line-height: 1.45; margin-top: 3px; overflow-wrap: anywhere; }
+  .mrtrait .lbl { color: var(--faint); font-size: 10px; letter-spacing: 1px; }
+  .mrtrait.good { color: var(--dim); }
+  .mrtrait.warn { color: var(--amber); }
   .tierrow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
   .tierrow .ftier { width: 66px; text-align: center; flex-shrink: 0; }
   .tierrow select {
@@ -667,7 +738,7 @@ export const VIEWER_HTML: string = `<!doctype html>
   <a id="hivelink" href="#/" style="display:none" title="back to the hive">&#8592; hive</a>
   <span id="swarmtitle" style="display:none"></span>
   <div class="vitals" id="dashvitals">
-    <div class="vital"><span>turns</span><div class="turnbar" id="turnbar"><i></i></div><b id="turnnum">0/0</b></div>
+    <div class="vital"><span>turns</span><div class="turnbar" id="turnbar"><i></i></div><b id="turnnum">0/0</b><span id="capnote">holding at cap &mdash; raise turns to resume</span></div>
     <div class="vital"><span>agents</span><b id="agentnum">0/0</b></div>
     <div class="vital"><span>events</span><b id="eventnum">0</b></div>
   </div>
@@ -752,8 +823,8 @@ export const VIEWER_HTML: string = `<!doctype html>
         <b id="cfg-maxagents-val">1</b>
         <label class="infbox" title="unlimited"><input id="cfg-maxagents-inf" type="checkbox">&#8734;</label>
       </div>
-      <div class="applyrow"><button class="applybtn" id="apply-limits">apply</button><span class="secmsg" id="msg-limits"></span></div>
-      <div class="cfghint">setting max turns at or below the current count halts the run &mdash; a soft stop. &#8734; means no ceiling.</div>
+      <label class="chkrow" title="at the turn cap, hold the swarm alive instead of stopping"><input id="cfg-holdatcap" type="checkbox">hold at cap</label>
+      <div class="cfghint">setting max turns at or below the current count halts the run &mdash; a soft stop, unless hold-at-cap keeps it alive to resume. &#8734; means no ceiling.</div>
     </div>
 
     <div class="cfgsec">
@@ -767,7 +838,12 @@ export const VIEWER_HTML: string = `<!doctype html>
         <input id="cfg-w-standard" type="number" step="any" min="0" placeholder="standard" title="standard weight">
         <input id="cfg-w-light" type="number" step="any" min="0" placeholder="light" title="light weight">
       </div>
-      <div class="applyrow"><button class="applybtn" id="apply-tiers">apply</button><span class="secmsg" id="msg-tiers"></span></div>
+    </div>
+
+    <div class="cfgsec">
+      <div class="sectitle">models</div>
+      <div id="modellist"></div>
+      <div class="cfghint" id="models-empty" style="display:none">no models in the catalog</div>
     </div>
 
     <div class="cfgsec">
@@ -777,15 +853,14 @@ export const VIEWER_HTML: string = `<!doctype html>
         <input id="cfg-delay" type="range" min="0" max="5000" step="100">
         <b id="cfg-delay-val">0s</b>
       </div>
-      <button id="pausebtn">PAUSE</button>
-      <div class="applyrow"><button class="applybtn" id="apply-pacing">apply</button><span class="secmsg" id="msg-pacing"></span></div>
+      <div class="applyrow"><button id="pausebtn">PAUSE</button></div>
+      <div class="applyrow"><span class="secmsg" id="msg-pause"></span></div>
     </div>
 
     <div class="cfgsec">
       <div class="sectitle">board</div>
       <div class="numrow"><label for="cfg-pinslots">pin slots</label><input id="cfg-pinslots" type="number" min="0" step="1"></div>
       <div class="numrow"><label for="cfg-ttl">claim ttl (ms)</label><input id="cfg-ttl" type="number" min="0" step="1000"></div>
-      <div class="applyrow"><button class="applybtn" id="apply-board">apply</button><span class="secmsg" id="msg-board"></span></div>
     </div>
 
     <div class="cfgsec">
@@ -793,8 +868,12 @@ export const VIEWER_HTML: string = `<!doctype html>
       <details class="cfgtext"><summary>root prompt</summary><pre id="cfg-prompt"></pre></details>
       <details class="cfgtext"><summary>protocol</summary><pre id="cfg-protocol"></pre></details>
       <textarea id="cfg-appendix" spellcheck="false" placeholder="protocol appendix&hellip;"></textarea>
-      <div class="applyrow"><button class="applybtn" id="apply-protocol">apply</button><span class="secmsg" id="msg-protocol"></span></div>
+      <label class="chkrow" title="force hive-style names on agent-initiated spawns"><input id="cfg-hivenames" type="checkbox">hive names</label>
     </div>
+  </div>
+  <div class="drawerfoot">
+    <button id="apply-all">APPLY ALL</button>
+    <span class="secmsg" id="msg-all"></span>
   </div>
 </aside>
 <div id="hovercard"></div>
@@ -852,8 +931,11 @@ export const VIEWER_HTML: string = `<!doctype html>
   // ---------- vitals ----------
   var INF = '\\u221e';
 
+  var holdAtCap = false;         // from last-loaded config; drives the header cap note
+
   function renderVitals(snap) {
     var bar = $('turnbar');
+    var atCap = false;
     if (snap.maxTotalTurns === null || snap.maxTotalTurns === undefined) {
       // unlimited: indeterminate slow pulse instead of a fill percentage
       bar.firstElementChild.style.width = '100%';
@@ -864,7 +946,9 @@ export const VIEWER_HTML: string = `<!doctype html>
       bar.firstElementChild.style.width = Math.min(100, pct) + '%';
       bar.className = 'turnbar' + (pct > 80 ? ' hot' : '');
       $('turnnum').textContent = snap.turnsTaken + '/' + snap.maxTotalTurns;
+      atCap = snap.turnsTaken >= snap.maxTotalTurns;
     }
+    $('capnote').className = (holdAtCap && atCap) ? 'show' : '';
     var maxA = (snap.maxAgents === null || snap.maxAgents === undefined) ? INF : snap.maxAgents;
     $('agentnum').textContent = snap.agents.length + '/' + maxA;
     $('eventnum').textContent = String(snap.lastEventId);
@@ -1410,7 +1494,7 @@ export const VIEWER_HTML: string = `<!doctype html>
     }
   }
 
-  function postConfig(payload, msgEl, onOk) {
+  function postConfig(payload, msgEl, onOk, onErr) {
     fetch(apiBase + '/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1420,12 +1504,14 @@ export const VIEWER_HTML: string = `<!doctype html>
     }).then(function (res) {
       if (!res.ok || (res.j && res.j.error)) {
         secMsg(msgEl, (res.j && res.j.error) || 'request failed', true);
+        if (onErr) onErr();
         return;
       }
       secMsg(msgEl, 'applied', false);
       if (onOk) onOk(res.j);
     }).catch(function () {
       secMsg(msgEl, 'request failed', true);
+      if (onErr) onErr();
     });
   }
 
@@ -1453,23 +1539,6 @@ export const VIEWER_HTML: string = `<!doctype html>
     if (!isNull) slider.value = value;
     limitReadout(slider, valEl, box);
   }
-
-  $('apply-limits').onclick = function () {
-    var payload = {
-      maxTotalTurns: $('cfg-maxturns-inf').checked ? null : Number($('cfg-maxturns').value),
-      maxAgents: $('cfg-maxagents-inf').checked ? null : Number($('cfg-maxagents').value),
-    };
-    postConfig(payload, $('msg-limits'), function (res) {
-      fillLimit('cfg-maxturns', res.maxTotalTurns);
-      fillLimit('cfg-maxagents', res.maxAgents);
-      // reflect new limits in the header vitals denominators right away
-      if (lastState) {
-        lastState.snapshot.maxTotalTurns = res.maxTotalTurns;
-        lastState.snapshot.maxAgents = res.maxAgents;
-        renderVitals(lastState.snapshot);
-      }
-    });
-  };
 
   // ----- tiers: adapter per tier + sampling weights -----
   function fillTierSelect(sel, adapters, current) {
@@ -1504,19 +1573,6 @@ export const VIEWER_HTML: string = `<!doctype html>
     }
   }
 
-  $('apply-tiers').onclick = function () {
-    var tiers = {}, weights = {}, anyWeight = false;
-    for (var i = 0; i < TIER_NAMES.length; i++) {
-      var t = TIER_NAMES[i];
-      tiers[t] = $('cfg-tier-' + t).value || null;
-      var raw = $('cfg-w-' + t).value.trim();
-      if (raw !== '') { weights[t] = Number(raw); anyWeight = true; }
-    }
-    var payload = { tiers: tiers };
-    if (anyWeight) payload.tierWeights = weights;
-    postConfig(payload, $('msg-tiers'), function (res) { fillTiers(res); });
-  };
-
   // ----- pacing: turn delay + the big pause lever -----
   function delayReadout() {
     $('cfg-delay-val').textContent = (Number($('cfg-delay').value) / 1000) + 's';
@@ -1532,36 +1588,154 @@ export const VIEWER_HTML: string = `<!doctype html>
 
   $('pausebtn').onclick = function () {
     // pause is immediate: no Apply between the overseer and the brakes
-    postConfig({ paused: !isPaused }, $('msg-pacing'), function (res) {
+    postConfig({ paused: !isPaused }, $('msg-pause'), function (res) {
       isPaused = !!res.paused;
       setPauseUI();
     });
   };
 
-  $('apply-pacing').onclick = function () {
-    postConfig({ turnDelayMs: Number($('cfg-delay').value) }, $('msg-pacing'), function (res) {
-      $('cfg-delay').value = res.turnDelayMs;
-      delayReadout();
-    });
-  };
+  // ----- model catalog: one row per model, retire/restore toggles -----
+  // loadedRetired = the retired-state as it stood when the drawer was filled;
+  // modelRetired = the live per-name toggle state. Diffing the two at apply
+  // time yields the retire[]/restore[] arrays.
+  var modelList = [];            // ModelCatalogEntry[] from the last-loaded config
+  var loadedRetired = {};        // name -> bool, as loaded
+  var modelRetired = {};         // name -> bool, current (mutated by the toggle)
 
-  // ----- board -----
-  $('apply-board').onclick = function () {
+  function costLabel(c) {
+    return c === 'cheap' ? 'cheap' : c === 'moderate' ? 'moderate' : c === 'expensive' ? 'expensive' : '';
+  }
+
+  function modelRow(m) {
+    var retired = !!modelRetired[m.name];
+    var row = document.createElement('div');
+    row.className = 'modelrow' + (retired ? ' retired' : '');
+
+    var head = document.createElement('div'); head.className = 'mrhead';
+    var nm = document.createElement('span'); nm.className = 'mrname'; nm.textContent = m.name;
+    head.appendChild(nm);
+    if (m.provider) {
+      var prov = document.createElement('span'); prov.className = 'mrprov'; prov.textContent = m.provider;
+      head.appendChild(prov);
+    }
+    if (m.costClass) {
+      var cost = document.createElement('span'); cost.className = 'mrcost cost-' + m.costClass;
+      cost.textContent = costLabel(m.costClass);
+      head.appendChild(cost);
+    }
+    if (m.isDefault) {
+      var def = document.createElement('span'); def.className = 'mrdefault'; def.textContent = 'default';
+      head.appendChild(def);
+    }
+    var btn = document.createElement('button');
+    btn.className = 'mrbtn' + (retired ? '' : ' retire');
+    btn.textContent = retired ? 'restore' : 'retire';
+    btn.onclick = function () {
+      modelRetired[m.name] = !modelRetired[m.name];
+      renderModels();
+    };
+    head.appendChild(btn);
+    row.appendChild(head);
+
+    var tiers = m.tiers || [];
+    if (tiers.length > 0) {
+      var tr = document.createElement('div'); tr.className = 'mrtiers';
+      for (var i = 0; i < tiers.length; i++) {
+        var tg = document.createElement('span'); tg.className = 'ftier tier-' + tiers[i]; tg.textContent = tiers[i];
+        tr.appendChild(tg);
+      }
+      row.appendChild(tr);
+    }
+
+    var strengths = m.strengths || [], cautions = m.cautions || [];
+    if (strengths.length > 0 || cautions.length > 0) {
+      var det = document.createElement('details'); det.className = 'mrmanifest';
+      var sum = document.createElement('summary'); sum.textContent = 'strengths & cautions';
+      det.appendChild(sum);
+      if (strengths.length > 0) {
+        var g = document.createElement('div'); g.className = 'mrtrait good';
+        var gl = document.createElement('span'); gl.className = 'lbl'; gl.textContent = 'strengths: ';
+        g.appendChild(gl); g.appendChild(document.createTextNode(strengths.join(', ')));
+        det.appendChild(g);
+      }
+      if (cautions.length > 0) {
+        var w = document.createElement('div'); w.className = 'mrtrait warn';
+        var wl = document.createElement('span'); wl.className = 'lbl'; wl.textContent = 'cautions: ';
+        w.appendChild(wl); w.appendChild(document.createTextNode(cautions.join(', ')));
+        det.appendChild(w);
+      }
+      row.appendChild(det);
+    }
+    return row;
+  }
+
+  function renderModels() {
+    var wrap = $('modellist');
+    wrap.textContent = '';
+    $('models-empty').style.display = modelList.length === 0 ? '' : 'none';
+    for (var i = 0; i < modelList.length; i++) wrap.appendChild(modelRow(modelList[i]));
+  }
+
+  function fillModels(cfg) {
+    modelList = cfg.models || [];
+    loadedRetired = {};
+    modelRetired = {};
+    for (var i = 0; i < modelList.length; i++) {
+      var m = modelList[i];
+      loadedRetired[m.name] = !!m.retired;
+      modelRetired[m.name] = !!m.retired;
+    }
+    renderModels();
+  }
+
+  // ----- one apply button: gather every editable control into one payload -----
+  $('apply-all').onclick = function () {
     var payload = {
+      maxTotalTurns: $('cfg-maxturns-inf').checked ? null : Number($('cfg-maxturns').value),
+      maxAgents: $('cfg-maxagents-inf').checked ? null : Number($('cfg-maxagents').value),
+      holdAtCap: $('cfg-holdatcap').checked,
+      turnDelayMs: Number($('cfg-delay').value),
       pinSlots: Number($('cfg-pinslots').value),
       claimTtlMs: Number($('cfg-ttl').value),
+      protocolAppendix: $('cfg-appendix').value,
+      hiveNames: $('cfg-hivenames').checked,
     };
-    postConfig(payload, $('msg-board'), function (res) {
-      $('cfg-pinslots').value = res.pinSlots;
-      $('cfg-ttl').value = res.claimTtlMs;
-    });
-  };
 
-  // ----- protocol appendix -----
-  $('apply-protocol').onclick = function () {
-    postConfig({ protocolAppendix: $('cfg-appendix').value }, $('msg-protocol'), function (res) {
-      $('cfg-appendix').value = res.protocolAppendix || '';
-    });
+    var tiers = {}, weights = {};
+    for (var i = 0; i < TIER_NAMES.length; i++) {
+      var t = TIER_NAMES[i];
+      tiers[t] = $('cfg-tier-' + t).value || null;
+      var raw = $('cfg-w-' + t).value.trim();
+      if (raw !== '') weights[t] = Number(raw);
+    }
+    payload.tiers = tiers;
+    payload.tierWeights = weights;
+
+    // diff the model retire toggles against what was loaded
+    var retire = [], restore = [];
+    for (var name in modelRetired) {
+      if (!modelRetired.hasOwnProperty(name)) continue;
+      var was = !!loadedRetired[name], now = !!modelRetired[name];
+      if (now && !was) retire.push(name);
+      else if (!now && was) restore.push(name);
+    }
+    if (retire.length > 0) payload.retire = retire;
+    if (restore.length > 0) payload.restore = restore;
+
+    var btn = this;
+    btn.disabled = true;
+    postConfig(payload, $('msg-all'), function (res) {
+      btn.disabled = false;
+      // refill the whole drawer from the returned config
+      fillConfig(res);
+      // reflect new limits + hold-at-cap in the header vitals right away
+      holdAtCap = !!res.holdAtCap;
+      if (lastState) {
+        lastState.snapshot.maxTotalTurns = res.maxTotalTurns;
+        lastState.snapshot.maxAgents = res.maxAgents;
+        renderVitals(lastState.snapshot);
+      }
+    }, function () { btn.disabled = false; });
   };
 
   function fillConfig(cfg) {
@@ -1571,7 +1745,10 @@ export const VIEWER_HTML: string = `<!doctype html>
     $('cfg-protocol').textContent = cfg.protocol;
     fillLimit('cfg-maxturns', cfg.maxTotalTurns);
     fillLimit('cfg-maxagents', cfg.maxAgents);
+    $('cfg-holdatcap').checked = !!cfg.holdAtCap;
+    holdAtCap = !!cfg.holdAtCap;
     fillTiers(cfg);
+    fillModels(cfg);
     $('cfg-delay').value = cfg.turnDelayMs || 0;
     delayReadout();
     isPaused = !!cfg.paused;
@@ -1579,11 +1756,14 @@ export const VIEWER_HTML: string = `<!doctype html>
     $('cfg-pinslots').value = cfg.pinSlots;
     $('cfg-ttl').value = cfg.claimTtlMs;
     $('cfg-appendix').value = cfg.protocolAppendix || '';
+    $('cfg-hivenames').checked = !!cfg.hiveNames;
+    // header note depends on holdAtCap; refresh it against current vitals
+    if (lastState) renderVitals(lastState.snapshot);
   }
 
   function loadConfig() {
     fetchJSON(apiBase + '/api/config').then(fillConfig).catch(function () {
-      secMsg($('msg-limits'), 'failed to load config', true);
+      secMsg($('msg-all'), 'failed to load config', true);
     });
   }
 

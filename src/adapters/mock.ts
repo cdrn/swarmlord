@@ -1,14 +1,28 @@
-import type { ModelAdapter, TurnRequest, TurnResult } from './types.js'
+import type { ModelAdapter, ModelManifest, TurnRequest, TurnResult } from './types.js'
 
 export type MockHandler = (req: TurnRequest, callIndex: number) => TurnResult
 
+export interface MockAdapterOptions {
+  /** Override the adapter name (default 'mock') — useful for multi-adapter tests. */
+  name?: string
+  /** Optional self-description, so a mock can stand in for a catalogued model. */
+  manifest?: ModelManifest
+}
+
 /** Scripted adapter for tests and offline demos. */
 export class MockAdapter implements ModelAdapter {
-  readonly name = 'mock'
+  readonly name: string
+  readonly manifest?: ModelManifest
 
   private callIndex = 0
 
-  constructor(private readonly handler: MockHandler) {}
+  constructor(
+    private readonly handler: MockHandler,
+    opts: MockAdapterOptions = {},
+  ) {
+    this.name = opts.name ?? 'mock'
+    this.manifest = opts.manifest
+  }
 
   async turn(req: TurnRequest): Promise<TurnResult> {
     const result = this.handler(req, this.callIndex++)
